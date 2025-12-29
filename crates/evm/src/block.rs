@@ -577,6 +577,16 @@ where
 
         self.evm_mut().ctx_mut().block.beneficiary = beneficiary;
 
+        // Log transaction execution result
+        if let Ok(ref res) = result {
+            if !res.result.is_success() {
+                tracing::error!(
+                    result = ?res.result,
+                    "Transaction execution failed"
+                );
+            }
+        }
+
         result
     }
 
