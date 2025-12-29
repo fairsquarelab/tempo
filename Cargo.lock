@@ -6554,6 +6554,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "plotpy"
+version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fd48715bdfaa8d1bceccf23bab6dfea3b89c14c62a3a7f3b726afdc16e3af440"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "plotters"
 version = "0.3.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11487,6 +11496,7 @@ dependencies = [
  "indicatif",
  "itertools 0.14.0",
  "mimalloc",
+ "plotpy",
  "rand 0.8.5",
  "rand 0.9.2",
  "rayon",
