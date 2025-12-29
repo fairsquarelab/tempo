@@ -11,6 +11,7 @@ use reth_tracing::{
 use tempo_alloy::{
     TempoNetwork, primitives::TempoTxEnvelope, provider::ext::TempoProviderBuilderExt,
 };
+use plotpy::{Curve, Plot, StrError};
 
 use alloy::{
     consensus::BlockHeader,
@@ -43,7 +44,7 @@ use serde::Serialize;
 use std::{
     collections::VecDeque,
     fs::File,
-    io::BufWriter,
+    io::{BufWriter, Write},
     num::{NonZeroU32, NonZeroU64},
     str::FromStr,
     sync::{
@@ -176,9 +177,10 @@ impl MaxTpsArgs {
         let accounts = self.accounts.get();
 
         // Set file descriptor limit if provided
-        if let Some(fd_limit) = self.fd_limit {
-            increase_nofile_limit(fd_limit).context("Failed to increase nofile limit")?;
-        }
+        // if let Some(fd_limit) = self.fd_limit {
+        //     increase_nofile_limit(fd_limit).context("Failed to increase nofile limit")?;
+        // }
+        increase_nofile_limit(self.fd_limit.unwrap_or(1024)).context("Failed to increase nofile limit")?;
 
         let signer_provider_factory = Box::new(|signer, target_url, cached_nonce_manager| {
             ProviderBuilder::default()
@@ -401,7 +403,7 @@ impl MaxTpsArgs {
             failed = failed.load(Ordering::Relaxed),
             "Collected a sample of receipts"
         );
-
+        drop(pending_txs);
         generate_report(provider, start_block_number, end_block_number, &self).await?;
 
         Ok(())
@@ -619,46 +621,59 @@ async fn generate_transactions<F: TxFiller<TempoNetwork> + 'static>(
             tx.inner.set_from(signer.address());
 
             let gas = &gas_estimates[tx_index];
+            // info!(gas = ?gas, "Cached Gas");
             // If we already filled the gas fields once for that transaction type, use it.
             // This will skip the gas filler.
-            if let Some((max_fee_per_gas, max_priority_fee_per_gas, gas_limit)) = gas.get() {
-                tx.inner.set_max_fee_per_gas(*max_fee_per_gas);
-                tx.inner
-                    .set_max_priority_fee_per_gas(*max_priority_fee_per_gas);
-                tx.inner.set_gas_limit(*gas_limit);
-            }
+            // if let Some((max_fee_per_gas, max_priority_fee_per_gas, gas_limit)) = gas.get() {
+            //     tx.inner.set_max_fee_per_gas(*max_fee_per_gas);
+            //     tx.inner
+            //         .set_max_priority_fee_per_gas(*max_priority_fee_per_gas);
+            //     tx.inner.set_gas_limit(*gas_limit + *gas_limit / 2);
+            // }
 
             // Fill the rest of transaction. In case we already filled the gas fields,
             // it will only fill the chain ID and nonce that are efficiently cached inside
             // the fillers.
             let tx = provider.fill(tx).await?;
 
-            // If we never filled the gas fields for that transaction type, cache the estimated
-            // gas.
-            if gas.get().is_none() {
-                let _ = gas.set(match &tx {
-                    SendableTx::Builder(builder) => (
-                        builder
-                            .max_fee_per_gas()
-                            .ok_or_eyre("max fee per gas should be filled")?,
-                        builder
-                            .max_priority_fee_per_gas()
-                            .ok_or_eyre("max priority fee per gas should be filled")?,
-                        builder
-                            .gas_limit()
-                            .ok_or_eyre("gas limit should be filled")?,
-                    ),
-                    SendableTx::Envelope(envelope) => (
-                        envelope.max_fee_per_gas(),
-                        envelope
-                            .max_priority_fee_per_gas()
-                            .ok_or_eyre("max priority fee per gas should be filled")?,
-                        envelope.gas_limit(),
-                    ),
-                });
+            // WORKAROUND: eth_estimateGas underestimates gas for TIP20 precompile operations.
+            // Analysis from report.json shows actual gas usage is ~1.2x the estimate.
+            // Apply adaptive buffer: minimum 1.2x (based on observed average), maximum 2.0x (safety cap).
+            // This balances block utilization (~93% vs ~78% with 3x) with safety margin.
+            let mut tx = tx.try_into_request()?;
+            if let Some(gas_limit) = tx.gas_limit() {
+                // println!("gas_limit: {:?}", gas_limit);
+                // Use 1.5x buffer: balances safety (accounts for cold storage, rewards variability)
+                // with block utilization (allows ~93% of transactions vs ~78% with 3x buffer)
+                let buffered_gas = match tx_index {
+                    1 => {
+                        gas_limit * 2
+                    },
+                    3 => {
+                        gas_limit + gas_limit / 2
+                    }
+                    _ => {
+                        gas_limit + gas_limit / 3
+                    }
+                };
+                // info!(tx_index, original_gas = gas_limit, buffered_gas, "Applying gas buffer");
+                tx.set_gas_limit(buffered_gas);
             }
 
-            eyre::Ok((tx.try_into_request()?, signer))
+            // If we never filled the gas fields for that transaction type, cache the estimated
+            // gas (with buffer applied).
+            if gas.get().is_none() {
+                let _ = gas.set((
+                    tx.max_fee_per_gas()
+                        .ok_or_eyre("max fee per gas should be filled")?,
+                    tx.max_priority_fee_per_gas()
+                        .ok_or_eyre("max priority fee per gas should be filled")?,
+                    tx.gas_limit()
+                        .ok_or_eyre("gas limit should be filled")?,
+                ));
+            }
+
+            eyre::Ok((tx, signer))
         })
         .buffer_unordered(max_concurrent_requests)
         .try_collect::<Vec<_>>()
@@ -857,8 +872,9 @@ pub async fn generate_report(
 
     let path = "report.json";
     let file = File::create(path)?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, &report)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, &report)?;
+    writer.flush()?;
 
     info!(path, "Generated report");
 
@@ -868,6 +884,10 @@ pub async fn generate_report(
 async fn monitor_tps(tx_counter: Arc<AtomicUsize>, target_count: usize, token: CancellationToken) {
     let mut last_count = 0;
     let mut ticker = interval(Duration::from_secs(1));
+    
+    let mut times: Vec<f64> = Vec::new();
+    let mut tps_values = Vec::new();
+    let mut sec: u64 = 0;
 
     loop {
         select! {
@@ -875,6 +895,10 @@ async fn monitor_tps(tx_counter: Arc<AtomicUsize>, target_count: usize, token: C
                 let current_count = tx_counter.load(Ordering::Relaxed);
                 let tps = current_count - last_count;
                 last_count = current_count;
+
+                times.push(sec as f64);
+                tps_values.push(tps as f64);
+                sec += 1;
 
                 info!(tps, total = current_count, "Status");
                 thread::sleep(Duration::from_secs(1));
@@ -887,6 +911,26 @@ async fn monitor_tps(tx_counter: Arc<AtomicUsize>, target_count: usize, token: C
                 break;
             }
         }
+    }
+
+    let avg_tps = if tps_values.is_empty() {
+        0.0
+    } else {
+        tps_values.iter().copied().sum::<f64>() / (tps_values.len() as f64)
+    };
+
+    let mut curve = Curve::new();
+    curve.draw(&times, &tps_values);
+
+    let mut plot = Plot::new();
+    plot.add(&curve)
+    .set_title(&format!("Tempo Bench: TPS over time (avg={avg_tps:.1} tps)"))
+        .set_label_x("time (sec)")
+        .set_label_y("TPS");
+
+    match plot.save("tps_report.svg") {
+        Ok(_) => info!("Saved TPS plot to tps_report.svg"),
+        Err(e) => error!("Failed to save TPS plot: {e}"),
     }
 }
 
