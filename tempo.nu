@@ -126,8 +126,10 @@ def "main kill" [
 
     # Remove stale IPC socket
     if $has_stale_ipc {
-        rm /tmp/reth.ipc
-        print "Removed /tmp/reth.ipc"
+        try {
+            rm /tmp/reth.ipc
+            print "Removed /tmp/reth.ipc"
+        }
     }
     print "Done."
 }
@@ -201,7 +203,7 @@ def run-dev-node [accounts: int, genesis: string, samply: bool, samply_args: lis
             rm -rf $LOCALNET_DIR
             mkdir $LOCALNET_DIR
             print $"Generating genesis with ($accounts) accounts..."
-            cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $LOCALNET_DIR -a $accounts --no-dkg-in-genesis
+            cargo run -p tempo-xtask --profile $profile -- generate-genesis --output $LOCALNET_DIR -a $accounts --no-dkg-in-genesis --gas-limit 1000000000
         }
         $default_genesis
     }
@@ -250,7 +252,7 @@ def build-dev-args [] {
         "--dev.block-time" "1sec"
         "--builder.gaslimit" "3000000000"
         "--builder.max-tasks" "8"
-        "--builder.deadline" "3"
+        "--builder.deadline" "1"
     ]
 }
 
@@ -278,7 +280,7 @@ def run-consensus-nodes [nodes: int, accounts: int, genesis: string, samply: boo
             let validators = (0..<$nodes | each { |i| $"127.0.0.1:($i * 100 + 8000)" } | str join ",")
 
             print $"Generating localnet with ($accounts) accounts and ($nodes) validators..."
-            cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $LOCALNET_DIR --accounts $accounts --validators $validators --force | ignore
+            cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $LOCALNET_DIR --accounts $accounts --gas-limit 250000000 --validators $validators --force | ignore
         }
     }
 
@@ -407,6 +409,7 @@ def "main bench" [
     --loud                                          # Show node logs (silent by default)
     --profile: string = $DEFAULT_PROFILE            # Cargo build profile
     --features: string = $DEFAULT_FEATURES          # Cargo features
+    --subblock                                      # Enable sub-block benchmarking mode
     --node-args: string = ""                        # Additional node arguments (space-separated)
     --bench-args: string = ""                       # Additional tempo-bench arguments (space-separated)
 ] {
@@ -502,8 +505,12 @@ def "main bench" [
             "--place-order-weight" $"($weights | get 3)"
         ]
     } else { [] })
+    | append (if $subblock { ["--subblock"] } else {[]})
     | append (if $bench_args != "" { $bench_args | split row " " } else { [] })
 
+    if $subblock {
+        print "🔹 Sub-block mode enabled"
+    }
     print $"Running benchmark: ($bench_cmd | str join ' ')"
     try {
         sh -c $"ulimit -Sn unlimited && ($bench_cmd | str join ' ')"
