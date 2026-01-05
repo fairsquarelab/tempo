@@ -697,17 +697,19 @@ async fn build_subblock(
 
             let txs = transactions.lock().clone();
             for (tx_hash, tx) in txs {
-                if tx.gas_limit() > gas_left {
+                let gas_limit = tx.gas_limit();
+                if gas_limit > gas_left {
                     continue;
                 }
+
                 if let Err(err) = evm.transact_commit(&*tx) {
                     warn!(%err, tx_hash = %tx_hash, "invalid subblock candidate transaction");
                     // Remove invalid transactions from the set.
                     transactions.lock().swap_remove(&tx_hash);
                     continue;
-                }
+                } 
 
-                gas_left -= tx.gas_limit();
+                gas_left -= gas_limit;
                 selected_transactions.push(tx.inner().clone());
                 senders.push(tx.signer());
 
