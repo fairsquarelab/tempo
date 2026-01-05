@@ -43,12 +43,13 @@ use rlimit::Resource;
 use serde::Serialize;
 use std::{
     collections::VecDeque,
-    fs::File,
+    fs::{File, OpenOptions},
     io::{BufWriter, Write},
     num::{NonZeroU32, NonZeroU64},
+    path::Path,
     str::FromStr,
     sync::{
-        Arc, OnceLock,
+        Arc, OnceLock, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -66,6 +67,7 @@ use tempo_precompiles::{
     stablecoin_exchange::{MAX_TICK, MIN_ORDER_AMOUNT, MIN_TICK, TICK_SPACING},
     tip20::{ISSUER_ROLE, token_id_to_address},
 };
+use tempo_primitives::subblock::TEMPO_SUBBLOCK_NONCE_KEY_PREFIX;
 use tokio::{
     select,
     time::{Sleep, interval, sleep},
@@ -166,6 +168,14 @@ pub struct MaxTpsArgs {
     /// Disable 2D nonces
     #[arg(long)]
     disable_2d_nonces: bool,
+
+    /// Enable sub-block transaction mode(requires validator pub key)
+    #[arg(long)]
+    subblock: bool,
+
+    /// Validator public keys for sub-block routing (comma-separated hex)
+    #[arg(long, value_delimiter = ',')]
+    validator_pubkeys: Vec<String>,
 }
 
 impl MaxTpsArgs {
@@ -308,6 +318,13 @@ impl MaxTpsArgs {
                 self.max_concurrent_transactions,
             )
             .await?
+        } else {
+            Vec::new()
+        };
+
+        // Fetch validator public keys if sub-block is enabled
+        let validator_pubkeys = if self.subblock {
+            fetch_validator_pubkeys(&self.target_urls).await? 
         } else {
             Vec::new()
         };
@@ -673,11 +690,14 @@ async fn generate_transactions<F: TxFiller<TempoNetwork> + 'static>(
                 ));
             }
 
-            eyre::Ok((tx, signer))
+            let mut txs = vec![(tx, signer.clone())];
+            eyre::Ok(txs)
         })
         .buffer_unordered(max_concurrent_requests)
         .try_collect::<Vec<_>>()
         .await?;
+
+    let builders = builders.into_iter().flatten().collect::<Vec<_>>();
     info!(
         transactions = builders.len(),
         tip20_transfers = tip20_transfers.load(Ordering::Relaxed),
@@ -701,6 +721,36 @@ async fn generate_transactions<F: TxFiller<TempoNetwork> + 'static>(
         .collect::<eyre::Result<Vec<_>>>()?;
 
     Ok(transactions)
+}
+
+async fn fetch_validator_pubkeys(target_urls: &[Url]) -> eyre::Result<Vec<B256>> {
+    let mut pubkeys = Vec::new();
+    for url in target_urls {
+        let provider = ProviderBuilder::new().connect_http(url.clone());
+        let maybe_key: Option<B256> = provider
+            .raw_request("admin_validatorKey".into(), NoParams::default())
+            .await
+            .context(format!("Failed to fetch validator key from {url}"))?;
+        if let Some(key) = maybe_key {
+            pubkeys.push(key);
+        }
+    }
+    ensure!(!pubkeys.is_empty(), "No validator public keys found");
+    Ok(pubkeys)
+}
+
+/// Builds a nonce key for a sub-block transaction.
+///
+/// The nonce key is a 256-bit value that is used to identify the transaction.
+/// 1. The first byte is `0x5b`, 
+/// 2. The next 15 bytes are the first 15 bytes of the validator public key,
+/// 3. The final 16 bytes are the random nonce.
+fn build_subblock_nonce_key(validator_pubkey: &[u8], random_nonce: u128) -> U256 {
+    let mut nonce_bytes = [0u8; 32];
+    nonce_bytes[0] = TEMPO_SUBBLOCK_NONCE_KEY_PREFIX; // First byte should be `0x5b`
+    nonce_bytes[1..16].copy_from_slice(&validator_pubkey[..15]); // Copy the first 15 bytes of the validator public key
+    nonce_bytes[16..32].copy_from_slice(&random_nonce.to_be_bytes()); // Copy the random nonce
+    U256::from_be_bytes(nonce_bytes)
 }
 
 /// Funds accounts from the faucet using `temp_fundAddress` RPC.
