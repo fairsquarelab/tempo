@@ -1,9 +1,8 @@
 mod dex;
 mod erc20;
 
-use alloy_consensus::Transaction;
 use itertools::Itertools;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use reth_tracing::{
     RethTracer, Tracer,
     tracing::{debug, error, info},
@@ -11,7 +10,7 @@ use reth_tracing::{
 use tempo_alloy::{
     TempoNetwork, primitives::TempoTxEnvelope, provider::ext::TempoProviderBuilderExt,
 };
-use plotpy::{Curve, Plot, StrError};
+use plotpy::{Curve, Plot};
 
 use alloy::{
     consensus::BlockHeader,
@@ -19,8 +18,7 @@ use alloy::{
     network::{ReceiptResponse, TransactionBuilder, TxSignerSync},
     primitives::{Address, B256, BlockNumber, U256},
     providers::{
-        DynProvider, PendingTransactionBuilder, PendingTransactionError, Provider, ProviderBuilder,
-        SendableTx, WatchTxError, fillers::TxFiller,
+        DynProvider, PendingTransactionBuilder, PendingTransactionError, Provider, ProviderBuilder, WatchTxError, fillers::TxFiller,
     },
     rpc::client::NoParams,
     signers::local::{
@@ -43,13 +41,12 @@ use rlimit::Resource;
 use serde::Serialize;
 use std::{
     collections::VecDeque,
-    fs::{File, OpenOptions},
+    fs::File,
     io::{BufWriter, Write},
     num::{NonZeroU32, NonZeroU64},
-    path::Path,
     str::FromStr,
     sync::{
-        Arc, OnceLock, Mutex,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
@@ -324,10 +321,11 @@ impl MaxTpsArgs {
 
         // Fetch validator public keys if sub-block is enabled
         let validator_pubkeys = if self.subblock {
-            fetch_validator_pubkeys(&self.target_urls).await? 
+            fetch_validator_pubkeys(&self.target_urls).await?
         } else {
             Vec::new()
         };
+        let validator_count = validator_pubkeys.len();
 
         // Generate all transactions
         let total_txs = self.tps * self.duration;
@@ -335,6 +333,7 @@ impl MaxTpsArgs {
         let place_order_weight = (self.place_order_weight * Self::WEIGHT_PRECISION).trunc() as u64;
         let swap_weight = (self.swap_weight * Self::WEIGHT_PRECISION).trunc() as u64;
         let erc20_weight = (self.erc20_weight * Self::WEIGHT_PRECISION).trunc() as u64;
+
         let transactions = generate_transactions(GenerateTransactionsInput {
             total_txs,
             accounts,
@@ -345,21 +344,88 @@ impl MaxTpsArgs {
             swap_weight,
             erc20_weight,
             quote_token,
-            user_tokens,
-            erc20_tokens,
+            user_tokens: user_tokens.clone(),
+            erc20_tokens: erc20_tokens.clone(),
         })
         .await
         .context("Failed to generate transactions")?;
 
-        // Send transactions
-        let mut pending_txs = send_transactions(
-            transactions,
-            signer_provider_manager.clone(),
-            self.max_concurrent_requests,
-            self.tps,
-            sleep(Duration::from_secs(self.duration)),
-        )
-        .await;
+        // Send transactions (with optional concurrent subblock transactions)
+        let mut pending_txs = if self.subblock && !validator_pubkeys.is_empty() {
+            info!("Running concurrent benchmark with regular and subblock transactions");
+
+            // Generate subblock transactions (10% of regular transactions)
+            let subblock_total_txs = (total_txs as f64 * 0.1) as u64;
+            let subblock_transactions = generate_subblock_transactions(
+                GenerateTransactionsInput {
+                    total_txs: subblock_total_txs,
+                    accounts,
+                    signer_provider_manager: signer_provider_manager.clone(),
+                    max_concurrent_requests: self.max_concurrent_requests,
+                    tip20_weight,
+                    place_order_weight,
+                    swap_weight,
+                    erc20_weight,
+                    quote_token,
+                    user_tokens,
+                    erc20_tokens,
+                },
+                validator_pubkeys,
+            )
+            .await
+            .context("Failed to generate subblock transactions")?;
+
+            // Use CancellationToken for coordinated shutdown
+            let cancel_token = CancellationToken::new();
+            let cancel_guard = cancel_token.clone().drop_guard();
+
+            // Spawn deadline task
+            tokio::spawn({
+                let cancel = cancel_token.clone();
+                let duration = self.duration;
+                async move {
+                    sleep(Duration::from_secs(duration)).await;
+                    cancel.cancel();
+                }
+            });
+
+            // Send both transaction types concurrently
+            let (regular_pending, subblock_pending) = tokio::join!(
+                send_transactions_with_cancel(
+                    transactions,
+                    signer_provider_manager.clone(),
+                    self.max_concurrent_requests,
+                    self.tps,
+                    false,
+                    cancel_token.clone(),
+                ),
+                send_transactions_with_cancel(
+                    subblock_transactions,
+                    signer_provider_manager.clone(),
+                    self.max_concurrent_requests,
+                    subblock_total_txs / self.duration, // Simple rate for subblock
+                    true,
+                    cancel_token.clone(),
+                )
+            );
+
+            drop(cancel_guard);
+
+            // Combine pending transactions from both streams
+            let mut combined = regular_pending;
+            combined.extend(subblock_pending);
+            combined
+        } else {
+            send_transactions(
+                transactions,
+                signer_provider_manager.clone(),
+                self.max_concurrent_requests,
+                self.tps,
+                sleep(Duration::from_secs(self.duration)),
+            )
+            .await
+        };
+
         let end_block_number = provider.get_block_number().await?;
 
         info!("Retrieving first block number from sent transactions");
@@ -421,7 +487,14 @@ impl MaxTpsArgs {
             "Collected a sample of receipts"
         );
         drop(pending_txs);
-        generate_report(provider, start_block_number, end_block_number, &self).await?;
+
+        // Pass validator count to generate_report if subblock is enabled
+        let validator_count_opt = if self.subblock && validator_count > 0 {
+            Some(validator_count)
+        } else {
+            None
+        };
+        generate_report(provider, start_block_number, end_block_number, &self, validator_count_opt).await?;
 
         Ok(())
     }
@@ -453,6 +526,98 @@ impl MnemonicArg {
             MnemonicArg::Random => Mnemonic::<English>::new(&mut rand_08::thread_rng()).to_phrase(),
         }
     }
+}
+
+/// Awaits pending transactions with cancellation token support.
+async fn send_transactions_with_cancel<F: TxFiller<TempoNetwork> + 'static>(
+    transactions: Vec<Vec<u8>>,
+    signer_provider_manager: SignerProviderManager<F>,
+    max_concurrent_requests: usize,
+    tps: u64,
+    is_subblock: bool,
+    cancel_token: CancellationToken,
+) -> VecDeque<PendingTransactionBuilder<TempoNetwork>> {
+    info!(
+        transactions = transactions.len(),
+        max_concurrent_requests, tps, "Sending transactions"
+    );
+
+    // Create shared transaction counter and monitoring
+    let tx_counter = Arc::new(AtomicUsize::new(0));
+
+    // Spawn monitoring task for TPS reporting
+    let cancel = CancellationToken::new();
+    let _drop_guard = cancel.clone().drop_guard();
+    // we only monitor TPS for regular transactions
+    if !is_subblock {
+        tokio::spawn(monitor_tps(
+            tx_counter.clone(),
+            transactions.len(),
+            cancel.clone(),
+        ));
+    }
+
+    // Create a rate limiter
+    let rate_limiter = RateLimiter::direct(Quota::per_second(NonZeroU32::new(tps as u32).unwrap()));
+
+    let failed = Arc::new(AtomicUsize::new(0));
+    let timeout = Arc::new(AtomicUsize::new(0));
+
+    let transactions_stream = stream::iter(transactions)
+        .ratelimit_stream(&rate_limiter)
+        .zip(stream::repeat_with(|| {
+            signer_provider_manager.random_unsigned_provider()
+        }))
+        .map(|(bytes, provider)| async move {
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                provider.send_raw_transaction(&bytes),
+            )
+            .await
+        })
+        .buffer_unordered(max_concurrent_requests)
+        .filter_map(|result| async {
+            match result {
+                Ok(Ok(pending_tx)) => {
+                    tx_counter.fetch_add(1, Ordering::Relaxed);
+                    Some(pending_tx)
+                }
+                Ok(Err(err)) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    debug!(?err, "Failed to send transaction");
+                    None
+                }
+                Err(_) => {
+                    timeout.fetch_add(1, Ordering::Relaxed);
+                    debug!("Transaction sending timed out");
+                    None
+                }
+            }
+        });
+
+    // Collect transactions until cancellation
+    let mut pending = VecDeque::new();
+    tokio::pin!(transactions_stream);
+
+    loop {
+        tokio::select! {
+            Some(pending_tx) = transactions_stream.next() => {
+                pending.push_back(pending_tx);
+            }
+            _ = cancel_token.cancelled() => {
+                break;
+            }
+        }
+    }
+
+    info!(
+        success = tx_counter.load(Ordering::Relaxed),
+        failed = failed.load(Ordering::Relaxed),
+        timeout = timeout.load(Ordering::Relaxed),
+        "Finished sending transactions"
+    );
+
+    pending
 }
 
 /// Awaits pending transactions with up to `tps` per second and `max_concurrent_requests` simultaneous in-flight requests. Stops when `deadline` future resolves.
@@ -690,7 +855,7 @@ async fn generate_transactions<F: TxFiller<TempoNetwork> + 'static>(
                 ));
             }
 
-            let mut txs = vec![(tx, signer.clone())];
+            let txs = vec![(tx, signer.clone())];
             eyre::Ok(txs)
         })
         .buffer_unordered(max_concurrent_requests)
@@ -719,6 +884,191 @@ async fn generate_transactions<F: TxFiller<TempoNetwork> + 'static>(
         })
         .map(|result| result.map(|tx| tx.encoded_2718()))
         .collect::<eyre::Result<Vec<_>>>()?;
+
+    Ok(transactions)
+}
+
+async fn generate_subblock_transactions<F: TxFiller<TempoNetwork> + 'static>(
+    input: GenerateTransactionsInput<F>,
+    validator_pubkeys: Vec<B256>,
+) -> eyre::Result<Vec<Vec<u8>>> {
+    let GenerateTransactionsInput {
+        total_txs,
+        accounts,
+        signer_provider_manager,
+        max_concurrent_requests,
+        tip20_weight,
+        place_order_weight,
+        swap_weight,
+        erc20_weight,
+        quote_token,
+        user_tokens,
+        erc20_tokens,
+    } = input;
+
+    ensure!(!validator_pubkeys.is_empty(), "No validator public keys provided for subblock transactions");
+
+    let txs_per_sender = total_txs / accounts;
+    ensure!(
+        txs_per_sender > 0,
+        "txs per sender is 0, increase tps or decrease senders"
+    );
+
+    info!(
+        transactions = total_txs,
+        validators = validator_pubkeys.len(),
+        "Generating subblock transactions"
+    );
+
+    const TX_TYPES: usize = 4;
+    // let tx_weights: [u64; TX_TYPES] = [tip20_weight, swap_weight, place_order_weight, erc20_weight];
+    let tx_weights: [u64; TX_TYPES] = [0, 0, 0, 1000];
+    let gas_estimates: [Arc<OnceLock<(u128, u128, u64)>>; TX_TYPES] = Default::default();
+
+    let tip20_transfers = Arc::new(AtomicUsize::new(0));
+    let swaps = Arc::new(AtomicUsize::new(0));
+    let orders = Arc::new(AtomicUsize::new(0));
+    let erc20_transfers = Arc::new(AtomicUsize::new(0));
+
+    let builders = ProgressBar::new(total_txs)
+        .wrap_stream(stream::iter(
+            std::iter::repeat_with(|| signer_provider_manager.random_unsigned_provider())
+                .take(total_txs as usize),
+        ))
+        .map(async |provider| {
+            let token = user_tokens.choose(&mut rand::rng()).copied().unwrap();
+
+            let tx_index = tx_weights
+                .iter()
+                .enumerate()
+                .collect::<Vec<_>>()
+                .choose_weighted(&mut rand::rng(), |(_, weight)| *weight)?
+                .0;
+
+            let mut tx = match tx_index {
+                0 => {
+                    tip20_transfers.fetch_add(1, Ordering::Relaxed);
+                    let token = ITIP20Instance::new(token, provider.clone());
+                    token
+                        .transfer(Address::random(), U256::ONE)
+                        .into_transaction_request()
+                }
+                1 => {
+                    swaps.fetch_add(1, Ordering::Relaxed);
+                    let exchange = IStablecoinExchangeInstance::new(
+                        STABLECOIN_EXCHANGE_ADDRESS,
+                        provider.clone(),
+                    );
+                    exchange
+                        .quoteSwapExactAmountIn(token, quote_token, 1)
+                        .into_transaction_request()
+                }
+                2 => {
+                    orders.fetch_add(1, Ordering::Relaxed);
+                    let exchange = IStablecoinExchangeInstance::new(
+                        STABLECOIN_EXCHANGE_ADDRESS,
+                        provider.clone(),
+                    );
+                    let tick =
+                        rand::random_range(MIN_TICK / TICK_SPACING..=MAX_TICK / TICK_SPACING)
+                            * TICK_SPACING;
+                    exchange
+                        .place(token, MIN_ORDER_AMOUNT, true, tick)
+                        .into_transaction_request()
+                }
+                3 => {
+                    erc20_transfers.fetch_add(1, Ordering::Relaxed);
+                    let token_address = erc20_tokens.choose(&mut rand::rng()).copied().unwrap();
+                    let token = erc20::MockERC20::new(token_address, provider.clone());
+                    token
+                        .transfer(Address::random(), U256::ONE)
+                        .into_transaction_request()
+                }
+                _ => unreachable!("Only {TX_TYPES} transaction types are supported"),
+            };
+
+            let signer = signer_provider_manager.random_signer();
+            tx.inner.set_from(signer.address());
+
+            let gas = &gas_estimates[tx_index];
+            let tx = provider.fill(tx).await?;
+
+            let mut tx = tx.try_into_request()?;
+            if let Some(gas_limit) = tx.gas_limit() {
+                let buffered_gas = match tx_index {
+                    1 => gas_limit * 2,
+                    3 => gas_limit + gas_limit / 2,
+                    _ => gas_limit + gas_limit / 3,
+                };
+                tx.set_gas_limit(buffered_gas);
+            }
+
+            if gas.get().is_none() {
+                let _ = gas.set((
+                    tx.max_fee_per_gas()
+                        .ok_or_eyre("max fee per gas should be filled")?,
+                    tx.max_priority_fee_per_gas()
+                        .ok_or_eyre("max priority fee per gas should be filled")?,
+                    tx.gas_limit()
+                        .ok_or_eyre("gas limit should be filled")?,
+                ));
+            }
+
+            let txs = vec![(tx, signer.clone())];
+            eyre::Ok(txs)
+        })
+        .buffer_unordered(max_concurrent_requests)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let builders = builders.into_iter().flatten().collect::<Vec<_>>();
+    info!(
+        transactions = builders.len(),
+        tip20_transfers = tip20_transfers.load(Ordering::Relaxed),
+        swaps = swaps.load(Ordering::Relaxed),
+        orders = orders.load(Ordering::Relaxed),
+        erc20_transfers = erc20_transfers.load(Ordering::Relaxed),
+        "Generated subblock transaction builders",
+    );
+
+    info!(transactions = builders.len(), "Signing subblock transactions");
+
+    // Calculate transactions per validator
+    let total_txs_count = builders.len();
+    let txs_per_validator = total_txs_count / validator_pubkeys.len();
+
+    // Sign transactions in parallel with subblock nonce keys
+    let transactions = builders
+        .into_par_iter()
+        .enumerate()
+        .progress()
+        .map(|(idx, (mut tx, signer))| -> eyre::Result<TempoTxEnvelope> {
+            // Determine which validator this transaction should target
+            let validator_idx = idx / txs_per_validator.max(1);
+            let validator_idx = validator_idx.min(validator_pubkeys.len() - 1);
+            let validator_pubkey = &validator_pubkeys[validator_idx];
+
+            // Generate random nonce for this subblock transaction
+            let random_nonce: u128 = rand::random();
+            let nonce_key = build_subblock_nonce_key(validator_pubkey.as_slice(), random_nonce);
+
+            // Set the subblock nonce key before building
+            tx.set_nonce_key(nonce_key);
+            tx.set_nonce(0); // Subblock transactions use nonce 0
+
+            // Build and sign the transaction
+            let mut tx_unsigned = tx.build_unsigned()?;
+            let sig = signer.sign_transaction_sync(tx_unsigned.as_dyn_signable_mut())?;
+            Ok(tx_unsigned.into_envelope(sig))
+        })
+        .map(|result| result.map(|tx| tx.encoded_2718()))
+        .collect::<eyre::Result<Vec<_>>>()?;
+
+    info!(
+        transactions = transactions.len(),
+        txs_per_validator,
+        "Signed and encoded subblock transactions"
+    );
 
     Ok(transactions)
 }
@@ -824,6 +1174,13 @@ struct BenchmarkedBlock {
 }
 
 #[derive(Serialize)]
+struct TransactionTypeStats {
+    sent: usize,
+    failed: usize,
+    timeout: usize,
+}
+
+#[derive(Serialize)]
 struct BenchmarkMetadata {
     target_tps: u64,
     run_duration_secs: u64,
@@ -842,12 +1199,20 @@ struct BenchmarkMetadata {
     place_order_weight: f64,
     swap_weight: f64,
     erc20_weight: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subblock_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    validator_count: Option<usize>,
 }
 
 #[derive(Serialize)]
 struct BenchmarkReport {
     metadata: BenchmarkMetadata,
     blocks: Vec<BenchmarkedBlock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regular_tx_stats: Option<TransactionTypeStats>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subblock_tx_stats: Option<TransactionTypeStats>,
 }
 
 pub async fn generate_report(
@@ -855,6 +1220,7 @@ pub async fn generate_report(
     start_block: BlockNumber,
     end_block: BlockNumber,
     args: &MaxTpsArgs,
+    validator_count: Option<usize>,
 ) -> eyre::Result<()> {
     info!(start_block, end_block, "Generating report");
 
@@ -913,11 +1279,15 @@ pub async fn generate_report(
         place_order_weight: args.place_order_weight,
         swap_weight: args.swap_weight,
         erc20_weight: args.erc20_weight,
+        subblock_enabled: if args.subblock { Some(true) } else { None },
+        validator_count,
     };
 
     let report = BenchmarkReport {
         metadata,
         blocks: benchmarked_blocks,
+        regular_tx_stats: None,  // TODO: Implement actual stats collection
+        subblock_tx_stats: None,
     };
 
     let path = "report.json";
