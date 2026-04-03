@@ -52,6 +52,21 @@ fn default_feed_ids() -> HashMap<Currency, (String, bool)> {
             // EUR/USD: 1 EUR = X USD — reciprocate to get EUR per USD.
             ("a995d00bb36a63cef7fd2c287dc105fc8f3d93779f062f09551b0af3e81ec30b".to_string(), true),
         ),
+        (
+            Currency::GBP,
+            // GBP/USD: 1 GBP = X USD — reciprocate to get GBP per USD.
+            ("84c2dde9633d93d1bcad84e7dc41c9d56578b7ec52fabedc1f335d673df0a7c1".to_string(), true),
+        ),
+        (
+            Currency::SGD,
+            // USD/SGD: direct — already units of SGD per 1 USD.
+            ("396a969a9c1480fa15ed50bc59149e2c0075a72fe8f458ed941ddec48bdb4918".to_string(), false),
+        ),
+        (
+            Currency::CHF,
+            // USD/CHF: direct — already units of CHF per 1 USD.
+            ("0b1e3297e69f162877b577b0d6a47a0d63b2392bc8499e6540da4187a63e28f8".to_string(), false),
+        ),
     ])
 }
 

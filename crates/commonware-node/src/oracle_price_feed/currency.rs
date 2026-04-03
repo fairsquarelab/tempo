@@ -20,6 +20,12 @@ pub enum Currency {
     JPY = 392,
     /// Euro.
     EUR = 978,
+    /// British Pound Sterling.
+    GBP = 826,
+    /// Singapore Dollar.
+    SGD = 702,
+    /// Swiss Franc.
+    CHF = 756,
 }
 
 /// The single base currency against which all FX scalars are quoted.
@@ -46,6 +52,9 @@ impl TryFrom<u32> for Currency {
             410 => Ok(Currency::KRW),
             392 => Ok(Currency::JPY),
             978 => Ok(Currency::EUR),
+            826 => Ok(Currency::GBP),
+            702 => Ok(Currency::SGD),
+            756 => Ok(Currency::CHF),
             _ => Err(UnknownCurrencyId(id)),
         }
     }
@@ -70,6 +79,9 @@ impl fmt::Display for Currency {
             Currency::KRW => "KRW",
             Currency::JPY => "JPY",
             Currency::EUR => "EUR",
+            Currency::GBP => "GBP",
+            Currency::SGD => "SGD",
+            Currency::CHF => "CHF",
         };
         f.write_str(s)
     }
@@ -84,6 +96,9 @@ impl FromStr for Currency {
             "KRW" => Ok(Currency::KRW),
             "JPY" => Ok(Currency::JPY),
             "EUR" => Ok(Currency::EUR),
+            "GBP" => Ok(Currency::GBP),
+            "SGD" => Ok(Currency::SGD),
+            "CHF" => Ok(Currency::CHF),
             _ => Err(UnknownCurrencyId(0)),
         }
     }
@@ -95,7 +110,15 @@ mod tests {
 
     #[test]
     fn iso_numeric_roundtrip() {
-        for c in [Currency::USD, Currency::KRW, Currency::JPY, Currency::EUR] {
+        for c in [
+            Currency::USD,
+            Currency::KRW,
+            Currency::JPY,
+            Currency::EUR,
+            Currency::GBP,
+            Currency::SGD,
+            Currency::CHF,
+        ] {
             assert_eq!(Currency::try_from(c.iso_numeric()), Ok(c));
         }
     }
@@ -113,7 +136,15 @@ mod tests {
 
     #[test]
     fn display_and_parse() {
-        for c in [Currency::USD, Currency::KRW, Currency::JPY, Currency::EUR] {
+        for c in [
+            Currency::USD,
+            Currency::KRW,
+            Currency::JPY,
+            Currency::EUR,
+            Currency::GBP,
+            Currency::SGD,
+            Currency::CHF,
+        ] {
             let s = c.to_string();
             assert_eq!(s.parse::<Currency>(), Ok(c));
         }

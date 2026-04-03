@@ -915,7 +915,7 @@ def run-consensus-nodes [nodes: int, accounts: int, genesis: string, samply: boo
 
             print $"Generating localnet with ($accounts) accounts and ($nodes) validators..."
             if $oracle_localnet {
-                cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $LOCALNET_DIR --accounts $accounts --validators $validators --force --oracle-currencies 410 --oracle-currencies 392 --oracle-currencies 978 --oracle-registry-admin 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --oracle-fund-signers $nodes | ignore
+                cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $LOCALNET_DIR --accounts $accounts --validators $validators --force --oracle-currencies 410 --oracle-currencies 392 --oracle-currencies 978 --oracle-currencies 826 --oracle-currencies 702 --oracle-currencies 756 --oracle-registry-admin 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --oracle-fund-signers $nodes | ignore
             } else {
                 cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $LOCALNET_DIR --accounts $accounts --validators $validators --force | ignore
             }
