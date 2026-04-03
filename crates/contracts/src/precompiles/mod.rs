@@ -2,6 +2,7 @@ pub mod account_keychain;
 pub mod common_errors;
 pub mod nonce;
 pub mod stablecoin_dex;
+pub mod tempo_oracle;
 pub mod tip20;
 pub mod tip20_factory;
 pub mod tip403_registry;
@@ -14,6 +15,7 @@ use alloy_primitives::{Address, address};
 pub use common_errors::*;
 pub use nonce::*;
 pub use stablecoin_dex::*;
+pub use tempo_oracle::*;
 pub use tip_fee_manager::*;
 pub use tip20::*;
 pub use tip20_factory::*;
@@ -35,3 +37,5 @@ pub const ACCOUNT_KEYCHAIN_ADDRESS: Address =
     address!("0xAAAAAAAA00000000000000000000000000000000");
 pub const VALIDATOR_CONFIG_V2_ADDRESS: Address =
     address!("0xCCCCCCCC00000000000000000000000000000001");
+/// TempoOracle precompile — pair registry + median prices (`setPrices` / `getOraclePrice`).
+pub const TEMPO_ORACLE_ADDRESS: Address = address!("0x0ACC010000000000000000000000000000000000");

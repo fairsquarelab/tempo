@@ -24,7 +24,8 @@ use std::{
 };
 use tempo_commonware_node::{
     BROADCASTER_CHANNEL_IDENT, BROADCASTER_LIMIT, CERTIFICATES_CHANNEL_IDENT, CERTIFICATES_LIMIT,
-    DKG_CHANNEL_IDENT, DKG_LIMIT, MARSHAL_CHANNEL_IDENT, MARSHAL_LIMIT, RESOLVER_CHANNEL_IDENT,
+    DKG_CHANNEL_IDENT, DKG_LIMIT, MARSHAL_CHANNEL_IDENT, MARSHAL_LIMIT,
+    ORACLE_PRICE_FEED_CHANNEL_IDENT, ORACLE_PRICE_FEED_LIMIT, RESOLVER_CHANNEL_IDENT,
     RESOLVER_LIMIT, SUBBLOCKS_CHANNEL_IDENT, SUBBLOCKS_LIMIT, VOTES_CHANNEL_IDENT, VOTES_LIMIT,
     consensus,
 };
@@ -316,6 +317,12 @@ where
             .register(SUBBLOCKS_CHANNEL_IDENT, SUBBLOCKS_LIMIT)
             .await
             .unwrap();
+        let oracle_price_feed = self
+            .oracle
+            .control(self.public_key())
+            .register(ORACLE_PRICE_FEED_CHANNEL_IDENT, ORACLE_PRICE_FEED_LIMIT)
+            .await
+            .unwrap();
 
         let consensus_handle = engine.start(
             votes,
@@ -325,6 +332,7 @@ where
             marshal,
             dkg,
             subblocks,
+            oracle_price_feed,
         );
 
         self.consensus_handle = Some(consensus_handle);

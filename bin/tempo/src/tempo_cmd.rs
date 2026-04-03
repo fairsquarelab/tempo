@@ -195,6 +195,9 @@ pub(crate) struct AddValidator {
     /// The fee recipient address
     #[arg(long, value_name = "ETHEREUM_ADDRESS")]
     fee_recipient: Address,
+    /// EOA allowed to submit `updatePriceFeed` (zero = same as validator address)
+    #[arg(long, value_name = "ETHEREUM_ADDRESS")]
+    oracle_feed_signer: Option<Address>,
 }
 
 impl AddValidator {
@@ -226,9 +229,14 @@ impl AddValidator {
             .await
             .wrap_err("failed to get chain id")?;
 
+        let oracle_feed_signer = self.oracle_feed_signer.unwrap_or(Address::ZERO);
         self.identity
             .to_config(chain_id)
-            .check_add_validator_signature(self.fee_recipient, self.submit.signature.as_ref())
+            .check_add_validator_signature(
+                self.fee_recipient,
+                oracle_feed_signer,
+                self.submit.signature.as_ref(),
+            )
             .wrap_err("add-validator signature check failed")?;
 
         let calldata = IValidatorConfigV2::addValidatorCall {
@@ -238,6 +246,7 @@ impl AddValidator {
             egress: self.identity.egress.to_string(),
             signature: self.submit.signature,
             feeRecipient: self.fee_recipient,
+            oracleFeedSigner: oracle_feed_signer,
         };
 
         let tx = TransactionRequest::default()
@@ -346,6 +355,9 @@ pub(crate) struct CreateAddValidatorSignatureArgs {
     /// The fee recipient address
     #[arg(long, value_name = "ETHEREUM_ADDRESS")]
     fee_recipient: Address,
+    /// Oracle feed submitter (zero = same as validator address)
+    #[arg(long, value_name = "ETHEREUM_ADDRESS")]
+    oracle_feed_signer: Option<Address>,
     /// RPC used to fetch the chain id
     #[arg(long, value_name = "RPC_URL")]
     chain_id_from_rpc_url: String,
@@ -378,7 +390,8 @@ impl CreateAddValidatorSignatureArgs {
             .wrap_err("failed to get chain id")?;
 
         let config = self.identity.to_config(chain_id);
-        let message = config.add_validator_message_hash(self.fee_recipient);
+        let oracle_feed_signer = self.oracle_feed_signer.unwrap_or(Address::ZERO);
+        let message = config.add_validator_message_hash(self.fee_recipient, oracle_feed_signer);
 
         let private_key = signing_key.into_inner();
         let signature = private_key.sign(VALIDATOR_NS_ADD, message.as_slice());

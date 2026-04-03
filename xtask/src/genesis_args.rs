@@ -53,6 +53,7 @@ use tempo_precompiles::{
     nonce::NonceManager,
     stablecoin_dex::StablecoinDEX,
     storage::{ContractStorage, StorageCtx},
+    tempo_oracle::TempoOracle,
     tip_fee_manager::{IFeeManager, TipFeeManager},
     tip20::{ISSUER_ROLE, ITIP20, TIP20Token},
     tip20_factory::TIP20Factory,
@@ -172,6 +173,36 @@ pub(crate) struct GenesisArgs {
     /// Whether to skip initializing validator config v1
     #[arg(long)]
     no_initialize_validator_config_v1: bool,
+
+    /// Initial `TempoOracle` median band (basis points); `0` disables banding in `setPriceFeed`.
+    #[arg(long, default_value_t = 0)]
+    oracle_max_deviation_bps: u32,
+
+    /// Initial oracle feed quorum numerator (default 2 for 2/3 of active validators).
+    #[arg(long, default_value_t = 2)]
+    oracle_feed_threshold_num: u64,
+
+    /// Initial oracle feed quorum denominator (must be non-zero).
+    #[arg(long, default_value_t = 3)]
+    oracle_feed_threshold_den: u64,
+
+    /// Oracle currency IDs (ISO 4217 numeric) to register at genesis, e.g. `--oracle-currencies 410 --oracle-currencies 392`.
+    #[arg(long = "oracle-currencies", value_name = "CURRENCY_ID")]
+    oracle_currencies: Vec<u32>,
+
+    /// Registry admin address for the oracle currency registry.
+    /// Required when --oracle-currencies is non-empty.
+    #[arg(long, value_name = "ADDRESS")]
+    oracle_registry_admin: Option<Address>,
+
+    /// Fund oracle EVM signer accounts in genesis and set them as `feeRecipient` in
+    /// ValidatorConfigV2 (mnemonic indices `base..base+N`). Must match node count.
+    #[arg(long, default_value_t = 0)]
+    oracle_fund_signers: u32,
+
+    /// Mnemonic base index for oracle EVM signer derivation (default 40, same as `prepare-oracle-localnet`).
+    #[arg(long, default_value_t = 40)]
+    oracle_mnemonic_base: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +254,13 @@ impl GenesisArgs {
     /// It creates a new genesis allocation for the configured accounts.
     /// And creates accounts for system contracts.
     pub(crate) async fn generate_genesis(self) -> eyre::Result<(Genesis, Option<ConsensusConfig>)> {
+        if self.oracle_feed_threshold_den == 0 {
+            eyre::bail!("--oracle-feed-threshold-den must be non-zero");
+        }
+        if !self.oracle_currencies.is_empty() && self.oracle_registry_admin.is_none() {
+            eyre::bail!("--oracle-registry-admin is required when --oracle-currencies is specified");
+        }
+
         println!("Generating {:?} accounts", self.accounts);
 
         let addresses: Vec<Address> = (0..self.accounts)
@@ -356,6 +394,18 @@ impl GenesisArgs {
             &self.validator_addresses[0..self.validators.len()]
         };
 
+        let oracle_fee_recipients: Vec<Address> = if self.oracle_fund_signers > 0 {
+            (0..self.oracle_fund_signers)
+                .map(|i| {
+                    let signer =
+                        MnemonicBuilder::from_phrase_nth(&self.mnemonic, self.oracle_mnemonic_base + i);
+                    secret_key_to_address(&signer.credential())
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         if self.t2_time == 0 {
             println!("Initializing validator config v2 (T2 active at genesis)");
             initialize_validator_config_v2(
@@ -365,6 +415,7 @@ impl GenesisArgs {
                 validator_onchain_addresses,
                 self.no_dkg_in_genesis,
                 self.chain_id,
+                &oracle_fee_recipients,
             )?;
         }
 
@@ -411,6 +462,16 @@ impl GenesisArgs {
 
         println!("Initializing account keychain");
         initialize_account_keychain(&mut evm)?;
+
+        println!("Initializing TempoOracle");
+        initialize_tempo_oracle(
+            &mut evm,
+            self.oracle_max_deviation_bps,
+            self.oracle_feed_threshold_num,
+            self.oracle_feed_threshold_den,
+            self.oracle_registry_admin,
+            &self.oracle_currencies,
+        )?;
 
         if !self.no_pairwise_liquidity {
             if let (Some(alpha), Some(beta), Some(theta)) =
@@ -537,6 +598,28 @@ impl GenesisArgs {
         chain_config
             .extra_fields
             .insert_value("t2Time".to_string(), self.t2_time)?;
+        chain_config.extra_fields.insert_value(
+            "oracleMaxDeviationBps".to_string(),
+            u64::from(self.oracle_max_deviation_bps),
+        )?;
+        chain_config.extra_fields.insert_value(
+            "oracleFeedThresholdNum".to_string(),
+            self.oracle_feed_threshold_num,
+        )?;
+        chain_config.extra_fields.insert_value(
+            "oracleFeedThresholdDen".to_string(),
+            self.oracle_feed_threshold_den,
+        )?;
+        if !self.oracle_currencies.is_empty() {
+            chain_config
+                .extra_fields
+                .insert_value("oracleCurrencies".to_string(), self.oracle_currencies.clone())?;
+        }
+        if let Some(admin) = self.oracle_registry_admin {
+            chain_config
+                .extra_fields
+                .insert_value("oracleRegistryAdmin".to_string(), format!("{admin:#x}"))?;
+        }
         let mut extra_data = Bytes::from_static(b"tempo-genesis");
 
         if let Some(consensus_config) = &consensus_config {
@@ -567,6 +650,26 @@ impl GenesisArgs {
 
         genesis.alloc = genesis_alloc;
         genesis.config = chain_config;
+
+        // Fund oracle EVM signer accounts so updatePriceFeed / setPriceFeed can pay gas.
+        if self.oracle_fund_signers > 0 {
+            let fund_wei = U256::from(10u128.pow(21)); // 1000 native tokens
+            for i in 0..self.oracle_fund_signers {
+                let idx = self.oracle_mnemonic_base + i;
+                let signer = MnemonicBuilder::from_phrase_nth(&self.mnemonic, idx);
+                let sk = signer.credential();
+                let addr = secret_key_to_address(&sk);
+                println!("  Funding oracle EVM signer {addr} (mnemonic idx {idx})");
+                genesis
+                    .alloc
+                    .entry(addr)
+                    .and_modify(|a| a.balance = a.balance.saturating_add(fund_wei))
+                    .or_insert_with(|| GenesisAccount {
+                        balance: fund_wei,
+                        ..Default::default()
+                    });
+            }
+        }
 
         Ok((genesis, consensus_config))
     }
@@ -886,6 +989,46 @@ fn initialize_account_keychain(evm: &mut TempoEvm<CacheDB<EmptyDB>>) -> eyre::Re
     Ok(())
 }
 
+/// Initializes the [`TempoOracle`] precompile and registers genesis currencies.
+fn initialize_tempo_oracle(
+    evm: &mut TempoEvm<CacheDB<EmptyDB>>,
+    oracle_max_deviation_bps: u32,
+    oracle_feed_threshold_num: u64,
+    oracle_feed_threshold_den: u64,
+    registry_admin: Option<Address>,
+    oracle_currencies: &[u32],
+) -> eyre::Result<()> {
+    let ctx = evm.ctx_mut();
+    StorageCtx::enter_evm(
+        &mut ctx.journaled_state,
+        &ctx.block,
+        &ctx.cfg,
+        &ctx.tx,
+        || -> tempo_precompiles::error::Result<()> {
+            let mut oracle = TempoOracle::new();
+            oracle.initialize_with_oracle_params(
+                oracle_max_deviation_bps,
+                oracle_feed_threshold_num,
+                oracle_feed_threshold_den,
+            )?;
+            if let Some(admin) = registry_admin {
+                for &currency_id in oracle_currencies {
+                    oracle.register_currency(admin, currency_id).map_err(|e| {
+                        tempo_precompiles::error::TempoPrecompileError::Fatal(
+                            format!("failed to register oracle currency {currency_id}: {e:?}")
+                                .into(),
+                        )
+                    })?;
+                    println!("  Registered oracle currency {currency_id}");
+                }
+            }
+            Ok(())
+        },
+    )?;
+
+    Ok(())
+}
+
 /// Initializes the initial validator config smart contract.
 ///
 /// NOTE: Does not populate it at all because consensus does not read the
@@ -972,6 +1115,7 @@ fn initialize_validator_config_v2(
     onchain_validator_addresses: &[Address],
     no_dkg_in_genesis: bool,
     chain_id: u64,
+    oracle_fee_recipients: &[Address],
 ) -> eyre::Result<()> {
     let ctx = evm.ctx_mut();
     StorageCtx::enter_evm(
@@ -1005,10 +1149,20 @@ fn initialize_validator_config_v2(
 
             println!("writing {num_validators} validators into v2 contract");
             for (i, validator) in consensus_config.validators.iter().enumerate() {
-                let validator_address = onchain_validator_addresses[i];
+                let onchain_addr = onchain_validator_addresses[i];
                 let public_key = validator.public_key();
                 let pubkey: B256 = public_key.encode().as_ref().try_into().unwrap();
                 let addr = validator.addr;
+
+                let validator_address = onchain_addr;
+                let oracle_feed_signer = oracle_fee_recipients
+                    .get(i)
+                    .copied()
+                    .unwrap_or(Address::ZERO);
+                let fee_recipient = oracle_fee_recipients
+                    .get(i)
+                    .copied()
+                    .unwrap_or(validator_address);
 
                 let config = tempo_validator_config::ValidatorConfig {
                     chain_id,
@@ -1018,7 +1172,8 @@ fn initialize_validator_config_v2(
                     egress: addr.ip(),
                 };
 
-                let message = config.add_validator_message_hash(validator_address);
+                let message =
+                    config.add_validator_message_hash(fee_recipient, oracle_feed_signer);
                 let private_key = validator.signing_key.clone().into_inner();
                 let signature = private_key.sign(
                     tempo_precompiles::validator_config_v2::VALIDATOR_NS_ADD,
@@ -1032,7 +1187,8 @@ fn initialize_validator_config_v2(
                         publicKey: pubkey,
                         ingress: config.ingress.to_string(),
                         egress: config.egress.to_string(),
-                        feeRecipient: validator_address,
+                        feeRecipient: fee_recipient,
+                        oracleFeedSigner: oracle_feed_signer,
                         signature: signature.encode().to_vec().into(),
                     },
                 )
@@ -1042,6 +1198,7 @@ fn initialize_validator_config_v2(
                     "added validator (v2)\
                     \n\tpublic key: {public_key}\
                     \n\tonchain address: {validator_address}\
+                    \n\toracle feed signer: {oracle_feed_signer}\
                     \n\tnet address: {addr}"
                 );
             }

@@ -275,6 +275,10 @@ pub enum TempoPoolTransactionError {
     #[error("Tempo Transaction with subblock nonce key prefix aren't supported in the pool")]
     SubblockNonceKey,
 
+    /// Same transaction was already executed in the top-of-block oracle section of this payload build.
+    #[error("Transaction already included in top-of-block oracle bundle")]
+    OracleTopOfBlockDuplicate,
+
     /// Thrown if the fee payer of a transaction cannot transfer (is blacklisted) the fee token, thus making the payment impossible.
     #[error("Fee payer {fee_payer} is blacklisted by fee token: {fee_token}")]
     BlackListedFeePayer {
@@ -416,7 +420,8 @@ impl PoolTransactionError for TempoPoolTransactionError {
             | Self::Keychain(_)
             | Self::InsufficientLiquidity(_)
             | Self::SpendingLimitExceeded { .. }
-            | Self::V2KeychainPreT1C => false,
+            | Self::V2KeychainPreT1C
+            | Self::OracleTopOfBlockDuplicate => false,
             Self::NonZeroValue
             | Self::SubblockNonceKey
             | Self::InsufficientGasForAAIntrinsicCost { .. }

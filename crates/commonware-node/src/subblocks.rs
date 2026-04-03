@@ -669,7 +669,7 @@ impl Reporter for Mailbox {
     }
 }
 
-fn evm_at_block(
+pub(crate) fn evm_at_block(
     node: &TempoFullNode,
     hash: BlockHash,
 ) -> eyre::Result<TempoEvm<State<StateProviderDatabase<StateProviderBox>>>> {

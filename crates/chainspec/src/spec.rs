@@ -89,6 +89,22 @@ pub struct TempoGenesisInfo {
     /// Activation timestamp for T2 hardfork.
     #[serde(skip_serializing_if = "Option::is_none")]
     t2_time: Option<u64>,
+    /// Initial `oracle_max_deviation_bps` for [`TempoOracle`] (genesis `initialize` seeds storage).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oracle_max_deviation_bps: Option<u32>,
+    /// Initial feed quorum numerator (`ceil(active * num / den)`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oracle_feed_threshold_num: Option<u64>,
+    /// Initial feed quorum denominator; must be non-zero when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oracle_feed_threshold_den: Option<u64>,
+    /// Initial oracle currency IDs to register at genesis (ISO 4217 numeric, e.g. `[410, 392, 978]`).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    oracle_currencies: Vec<u32>,
+    /// Registry admin address for the oracle currency registry.
+    /// Required when `oracle_currencies` is non-empty; becomes the admin on first `registerCurrency`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oracle_registry_admin: Option<Address>,
 }
 
 impl TempoGenesisInfo {
@@ -101,8 +117,38 @@ impl TempoGenesisInfo {
             .unwrap_or_default()
     }
 
+    /// Same as [`Self::extract_from`], public for genesis tooling (e2e, tests).
+    pub fn from_genesis(genesis: &Genesis) -> Self {
+        Self::extract_from(genesis)
+    }
+
     pub fn epoch_length(&self) -> Option<u64> {
         self.epoch_length
+    }
+
+    /// Basis points band for `setPriceFeed` median filtering; `0` disables.
+    pub fn oracle_max_deviation_bps(&self) -> u32 {
+        self.oracle_max_deviation_bps.unwrap_or(0)
+    }
+
+    /// Quorum numerator for oracle feed aggregation (default 2).
+    pub fn oracle_feed_threshold_num(&self) -> u64 {
+        self.oracle_feed_threshold_num.unwrap_or(2)
+    }
+
+    /// Quorum denominator for oracle feed aggregation (default 3).
+    pub fn oracle_feed_threshold_den(&self) -> u64 {
+        self.oracle_feed_threshold_den.unwrap_or(3)
+    }
+
+    /// Currency IDs to register at genesis (ISO 4217 numeric, e.g. `[410, 392, 978]`).
+    pub fn oracle_currencies(&self) -> &[u32] {
+        &self.oracle_currencies
+    }
+
+    /// Registry admin address; `None` when no currencies are configured.
+    pub fn oracle_registry_admin(&self) -> Option<Address> {
+        self.oracle_registry_admin
     }
 
     /// Returns the activation timestamp for a given hardfork, or `None` if not scheduled.

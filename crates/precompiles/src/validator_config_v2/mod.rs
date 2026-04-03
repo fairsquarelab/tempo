@@ -30,7 +30,10 @@ pub const VALIDATOR_NS_ROTATE: &[u8] = b"TEMPO_VALIDATOR_CONFIG_V2_ROTATE_VALIDA
 
 /// Distinguishes `addValidator` from `rotateValidator` signatures at the type level.
 enum SignatureKind {
-    Add { fee_recipient: Address },
+    Add {
+        fee_recipient: Address,
+        oracle_feed_signer: Address,
+    },
     Rotate,
 }
 
@@ -130,6 +133,8 @@ struct ValidatorRecord {
     added_at_height: u64,
     /// Block height at which this record was deactivated (0 = still active).
     deactivated_at_height: u64,
+    /// EOA allowed to submit TempoOracle `updatePriceFeed`; `ZERO` means use `validator_address`.
+    oracle_feed_signer: Address,
 }
 
 /// Validator Config V2 precompile — manages consensus validators with append-only,
@@ -145,6 +150,7 @@ struct ValidatorRecord {
 /// provide O(1) lookups:
 /// - `address_to_index`: validator address -> 1-indexed position (0 = not found)
 /// - `pubkey_to_index`: public key -> 1-indexed position (0 = not found)
+/// - `oracle_feed_signer_to_index`: effective oracle submitter EOA -> 1-indexed position
 ///
 /// A separate `active_indices` vec stores 1-indexed global positions of active validators,
 /// enabling O(active_count) enumeration without scanning deactivated entries. Each validator
@@ -172,6 +178,8 @@ pub struct ValidatorConfigV2 {
     /// Compact list of 1-indexed global positions of currently active validators.
     /// Order is NOT stable (swap-and-pop on deactivation).
     active_indices: Vec<u64>,
+    /// Effective oracle `updatePriceFeed` signer -> 1-indexed position in `validators` (0 = none).
+    oracle_feed_signer_to_index: Mapping<Address, u64>,
 }
 
 impl ValidatorConfigV2 {
@@ -244,10 +252,32 @@ impl ValidatorConfigV2 {
             ingress: v.ingress,
             egress: v.egress,
             feeRecipient: v.fee_recipient,
+            oracleFeedSigner: v.oracle_feed_signer,
             index: v.index,
             addedAtHeight: v.added_at_height,
             deactivatedAtHeight: v.deactivated_at_height,
         })
+    }
+
+    /// Looks up an **active** validator by the EOA that may submit `updatePriceFeed`.
+    ///
+    /// `oracleFeedSigner` on the record may be zero; the effective signer is then `validatorAddress`.
+    ///
+    /// # Errors
+    /// - `ValidatorNotFound` — no active validator for this signer
+    pub fn validator_by_oracle_feed_signer(
+        &self,
+        signer: Address,
+    ) -> Result<IValidatorConfigV2::Validator> {
+        let idx1 = self.oracle_feed_signer_to_index[signer].read()?;
+        if idx1 == 0 {
+            Err(ValidatorConfigV2Error::validator_not_found())?
+        }
+        let v = self.read_validator_at(idx1 - 1)?;
+        if v.deactivatedAtHeight != 0 {
+            Err(ValidatorConfigV2Error::validator_not_found())?
+        }
+        Ok(v)
     }
 
     /// Returns the validator registry at the given global index in the `validators` array.
@@ -395,6 +425,30 @@ impl ValidatorConfigV2 {
         Ok(())
     }
 
+    #[inline]
+    fn effective_oracle_feed_signer(stored: Address, validator_address: Address) -> Address {
+        if stored.is_zero() {
+            validator_address
+        } else {
+            stored
+        }
+    }
+
+    /// Ensures no **active** validator already uses `effective` as its oracle submitter.
+    fn require_free_oracle_feed_signer(&self, effective: Address) -> Result<()> {
+        let idx1 = self.oracle_feed_signer_to_index[effective].read()?;
+        if idx1 == 0 {
+            return Ok(());
+        }
+        let deactivated = self.validators[(idx1 - 1) as usize]
+            .deactivated_at_height
+            .read()?;
+        if deactivated == 0 {
+            Err(ValidatorConfigV2Error::oracle_feed_signer_already_in_use())?
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn append_validator(
         &mut self,
@@ -403,6 +457,7 @@ impl ValidatorConfigV2 {
         ingress: String,
         egress: String,
         fee_recipient: Address,
+        oracle_feed_signer: Address,
         added_at_height: u64,
         deactivated_at_height: u64,
     ) -> Result<u64> {
@@ -410,6 +465,8 @@ impl ValidatorConfigV2 {
         let mut active_idx = 0u64;
 
         if deactivated_at_height == 0 {
+            let effective = Self::effective_oracle_feed_signer(oracle_feed_signer, addr);
+            self.require_free_oracle_feed_signer(effective)?;
             self.active_indices.push(count + 1)?; // 1-indexed
             active_idx = self.active_indices.len()? as u64; // 1-indexed
         }
@@ -424,6 +481,7 @@ impl ValidatorConfigV2 {
             active_idx,
             added_at_height,
             deactivated_at_height,
+            oracle_feed_signer,
         };
 
         self.validators.push(v)?;
@@ -431,6 +489,11 @@ impl ValidatorConfigV2 {
         self.pubkey_to_index[pubkey].write(count + 1)?;
         // for any dups the prev entries must be deactivated since we check above
         self.address_to_index[addr].write(count + 1)?;
+
+        if deactivated_at_height == 0 {
+            let effective = Self::effective_oracle_feed_signer(oracle_feed_signer, addr);
+            self.oracle_feed_signer_to_index[effective].write(count + 1)?;
+        }
 
         Ok(count)
     }
@@ -492,8 +555,12 @@ impl ValidatorConfigV2 {
         hasher.update(egress.as_bytes());
 
         let namespace = match kind {
-            SignatureKind::Add { fee_recipient } => {
+            SignatureKind::Add {
+                fee_recipient,
+                oracle_feed_signer,
+            } => {
                 hasher.update(fee_recipient.as_slice());
+                hasher.update(oracle_feed_signer.as_slice());
                 VALIDATOR_NS_ADD
             }
             SignatureKind::Rotate => VALIDATOR_NS_ROTATE,
@@ -516,7 +583,7 @@ impl ValidatorConfigV2 {
     /// Adds a new validator to the set (owner only).
     ///
     /// Requires a valid Ed25519 signature, using the [`VALIDATOR_NS_ADD`] namespace, over
-    /// `keccak256(chainId || contractAddr || validatorAddr || len(ingress) || ingress || len(egress) || egress || feeRecipient)`
+    /// `keccak256(chainId || contractAddr || validatorAddr || len(ingress) || ingress || len(egress) || egress || feeRecipient || oracleFeedSigner)`
     /// which proves that the caller controls the private key corresponding to `publicKey`.
     ///
     /// # Errors
@@ -543,6 +610,7 @@ impl ValidatorConfigV2 {
         self.verify_validator_signature(
             SignatureKind::Add {
                 fee_recipient: call.feeRecipient,
+                oracle_feed_signer: call.oracleFeedSigner,
             },
             &call.publicKey,
             &call.signature,
@@ -561,6 +629,7 @@ impl ValidatorConfigV2 {
             call.ingress.clone(),
             call.egress.clone(),
             call.feeRecipient,
+            call.oracleFeedSigner,
             block_height,
             0,
         )?;
@@ -573,6 +642,7 @@ impl ValidatorConfigV2 {
                 ingress: call.ingress,
                 egress: call.egress,
                 feeRecipient: call.feeRecipient,
+                oracleFeedSigner: call.oracleFeedSigner,
             },
         ))?;
 
@@ -602,6 +672,9 @@ impl ValidatorConfigV2 {
         self.config
             .read()?
             .require_owner_or_validator(sender, v.validator_address)?;
+
+        let eff = Self::effective_oracle_feed_signer(v.oracle_feed_signer, v.validator_address);
+        self.oracle_feed_signer_to_index[eff].delete()?;
 
         self.active_ingress_ips[Self::ingress_key(&v.ingress)?].delete()?;
 
@@ -745,6 +818,7 @@ impl ValidatorConfigV2 {
             active_idx: 0,
             added_at_height: v.added_at_height,
             deactivated_at_height: block_height,
+            oracle_feed_signer: v.oracle_feed_signer,
         };
         self.validators.push(snapshot)?;
 
@@ -865,11 +939,19 @@ impl ValidatorConfigV2 {
         self.require_new_address(call.newAddress)?;
 
         let old_address = v.validator_address;
+        let old_eff = Self::effective_oracle_feed_signer(v.oracle_feed_signer, old_address);
         v.validator_address = call.newAddress;
+        let new_eff = Self::effective_oracle_feed_signer(v.oracle_feed_signer, v.validator_address);
         self.validators[call.idx as usize].write(v)?;
 
         self.address_to_index[old_address].delete()?;
         self.address_to_index[call.newAddress].write(call.idx + 1)?;
+
+        if old_eff != new_eff {
+            self.oracle_feed_signer_to_index[old_eff].delete()?;
+            self.require_free_oracle_feed_signer(new_eff)?;
+            self.oracle_feed_signer_to_index[new_eff].write(call.idx + 1)?;
+        }
 
         self.emit_event(ValidatorConfigV2Event::ValidatorOwnershipTransferred(
             IValidatorConfigV2::ValidatorOwnershipTransferred {
@@ -1006,6 +1088,7 @@ impl ValidatorConfigV2 {
             v1_val.inboundAddress,
             egress,
             Address::ZERO,
+            Address::ZERO,
             block_height,
             if now_active { 0 } else { block_height },
         )?;
@@ -1103,8 +1186,12 @@ mod tests {
         ]);
         hasher.update(egress.as_bytes());
         let namespace = match kind {
-            SignatureKind::Add { fee_recipient } => {
+            SignatureKind::Add {
+                fee_recipient,
+                oracle_feed_signer,
+            } => {
                 hasher.update(fee_recipient.as_slice());
+                hasher.update(oracle_feed_signer.as_slice());
                 VALIDATOR_NS_ADD
             }
             SignatureKind::Rotate => VALIDATOR_NS_ROTATE,
@@ -1131,6 +1218,7 @@ mod tests {
         ingress: &str,
         egress: &str,
         fee_recipient: Address,
+        oracle_feed_signer: Address,
         signature: Vec<u8>,
     ) -> IValidatorConfigV2::addValidatorCall {
         IValidatorConfigV2::addValidatorCall {
@@ -1139,6 +1227,7 @@ mod tests {
             ingress: ingress.to_string(),
             egress: egress.to_string(),
             feeRecipient: fee_recipient,
+            oracleFeedSigner: oracle_feed_signer,
             signature: signature.into(),
         }
     }
@@ -1150,13 +1239,25 @@ mod tests {
         egress: &str,
         fee_recipient: Address,
     ) -> IValidatorConfigV2::addValidatorCall {
+        let oracle_feed_signer = Address::ZERO;
         let (pubkey, signature) = make_test_keypair_and_signature(
             addr,
             ingress,
             egress,
-            SignatureKind::Add { fee_recipient },
+            SignatureKind::Add {
+                fee_recipient,
+                oracle_feed_signer,
+            },
         );
-        make_add_call(addr, pubkey, ingress, egress, fee_recipient, signature)
+        make_add_call(
+            addr,
+            pubkey,
+            ingress,
+            egress,
+            fee_recipient,
+            oracle_feed_signer,
+            signature,
+        )
     }
 
     #[test]
@@ -1189,9 +1290,7 @@ mod tests {
                 validator,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add {
-                    fee_recipient: validator,
-                },
+                SignatureKind::Add { fee_recipient: validator, oracle_feed_signer: Address::ZERO },
             );
             vc.storage.set_block_number(200);
             vc.add_validator(
@@ -1202,6 +1301,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     validator,
+                    Address::ZERO,
                     signature,
                 ),
             )?;
@@ -1220,6 +1320,78 @@ mod tests {
 
             let v3 = vc.validator_by_public_key(pubkey)?;
             assert_eq!(v3.validatorAddress, validator);
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_oracle_feed_signer_mapping_and_duplicate_rejected() -> eyre::Result<()> {
+        let mut storage = HashMapStorageProvider::new(1);
+        let owner = Address::random();
+        let val_addr = Address::random();
+        let oracle = Address::random();
+        StorageCtx::enter(&mut storage, || {
+            let mut vc = ValidatorConfigV2::new();
+            vc.initialize(owner)?;
+
+            let fee = Address::random();
+            let (pubkey, signature) = make_test_keypair_and_signature(
+                val_addr,
+                "192.168.1.1:8000",
+                "192.168.1.1",
+                SignatureKind::Add {
+                    fee_recipient: fee,
+                    oracle_feed_signer: oracle,
+                },
+            );
+            vc.storage.set_block_number(200);
+            vc.add_validator(
+                owner,
+                make_add_call(
+                    val_addr,
+                    pubkey,
+                    "192.168.1.1:8000",
+                    "192.168.1.1",
+                    fee,
+                    oracle,
+                    signature,
+                ),
+            )?;
+
+            let by_oracle = vc.validator_by_oracle_feed_signer(oracle)?;
+            assert_eq!(by_oracle.validatorAddress, val_addr);
+            assert_eq!(by_oracle.oracleFeedSigner, oracle);
+
+            // Second active validator cannot reuse the same oracle submitter.
+            let val2 = Address::random();
+            let fee2 = Address::random();
+            let (pk2, sig2) = make_test_keypair_and_signature(
+                val2,
+                "192.168.1.2:8000",
+                "192.168.1.2",
+                SignatureKind::Add {
+                    fee_recipient: fee2,
+                    oracle_feed_signer: oracle,
+                },
+            );
+            vc.storage.set_block_number(201);
+            let err = vc.add_validator(
+                owner,
+                make_add_call(
+                    val2,
+                    pk2,
+                    "192.168.1.2:8000",
+                    "192.168.1.2",
+                    fee2,
+                    oracle,
+                    sig2,
+                ),
+            );
+            assert_eq!(
+                err,
+                Err(ValidatorConfigV2Error::oracle_feed_signer_already_in_use().into())
+            );
 
             Ok(())
         })
@@ -1265,6 +1437,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     Address::random(),
+                    Address::ZERO,
                     vec![0u8; 64],
                 ),
             );
@@ -1320,9 +1493,7 @@ mod tests {
                 addr1,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add {
-                    fee_recipient: addr1,
-                },
+                SignatureKind::Add { fee_recipient: addr1, oracle_feed_signer: Address::ZERO },
             );
             vc.storage.set_block_number(200);
             vc.add_validator(
@@ -1333,6 +1504,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     addr1,
+                    Address::ZERO,
                     sig1,
                 ),
             )?;
@@ -1343,9 +1515,7 @@ mod tests {
                 addr2,
                 "192.168.1.2:8000",
                 "192.168.1.2",
-                SignatureKind::Add {
-                    fee_recipient: addr2,
-                },
+                SignatureKind::Add { fee_recipient: addr2, oracle_feed_signer: Address::ZERO },
             );
             vc.storage.set_block_number(201);
             let result = vc.add_validator(
@@ -1356,6 +1526,7 @@ mod tests {
                     "192.168.1.2:8000",
                     "192.168.1.2",
                     addr2,
+                    Address::ZERO,
                     sig2,
                 ),
             );
@@ -1466,9 +1637,7 @@ mod tests {
                 validator,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add {
-                    fee_recipient: validator,
-                },
+                SignatureKind::Add { fee_recipient: validator, oracle_feed_signer: Address::ZERO },
             );
             vc.storage.set_block_number(200);
             vc.add_validator(
@@ -1479,6 +1648,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     validator,
+                    Address::ZERO,
                     old_sig,
                 ),
             )?;
@@ -1735,9 +1905,7 @@ mod tests {
                 validator,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add {
-                    fee_recipient: validator,
-                },
+                SignatureKind::Add { fee_recipient: validator, oracle_feed_signer: Address::ZERO },
             );
             vc.storage.set_block_number(200);
             vc.add_validator(
@@ -1748,6 +1916,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     validator,
+                    Address::ZERO,
                     sig,
                 ),
             )?;
@@ -1878,9 +2047,7 @@ mod tests {
                 addr1,
                 "192.168.1.1:8000",
                 "192.168.1.1:9000",
-                SignatureKind::Add {
-                    fee_recipient: addr1,
-                },
+                SignatureKind::Add { fee_recipient: addr1, oracle_feed_signer: Address::ZERO },
             );
 
             // IP:port for egress should fail (egress validation happens before signature)
@@ -1892,6 +2059,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1:9000",
                     addr1,
+                    Address::ZERO,
                     sig1,
                 ),
             );
@@ -2151,9 +2319,7 @@ mod tests {
                 validator_addr,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add {
-                    fee_recipient: validator_addr,
-                },
+                SignatureKind::Add { fee_recipient: validator_addr, oracle_feed_signer: Address::ZERO },
             );
             vc.storage.set_block_number(200);
             vc.add_validator(
@@ -2164,6 +2330,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     validator_addr,
+                    Address::ZERO,
                     sig1,
                 ),
             )?;
@@ -2180,9 +2347,7 @@ mod tests {
                 validator_addr,
                 "192.168.1.2:8000",
                 "192.168.1.2",
-                SignatureKind::Add {
-                    fee_recipient: validator_addr,
-                },
+                SignatureKind::Add { fee_recipient: validator_addr, oracle_feed_signer: Address::ZERO },
             );
             vc.storage.set_block_number(400);
             vc.add_validator(
@@ -2193,6 +2358,7 @@ mod tests {
                     "192.168.1.2:8000",
                     "192.168.1.2",
                     validator_addr,
+                    Address::ZERO,
                     sig2,
                 ),
             )?;
@@ -2938,14 +3104,20 @@ mod tests {
                 addr1,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add {
-                    fee_recipient: addr1,
-                },
+                SignatureKind::Add { fee_recipient: addr1, oracle_feed_signer: Address::ZERO },
             );
             vc.storage.set_block_number(200);
             vc.add_validator(
                 owner,
-                make_add_call(addr1, pubkey, "192.168.1.1:8000", "192.168.1.1", addr1, sig),
+                make_add_call(
+                    addr1,
+                    pubkey,
+                    "192.168.1.1:8000",
+                    "192.168.1.1",
+                    addr1,
+                    Address::ZERO,
+                    sig,
+                ),
             )?;
 
             // Deactivate
@@ -2965,6 +3137,7 @@ mod tests {
                     "192.168.2.1:8000",
                     "192.168.2.1",
                     addr2,
+                    Address::ZERO,
                     vec![0u8; 64],
                 ),
             );
@@ -3196,7 +3369,7 @@ mod tests {
                 validator,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add { fee_recipient },
+                SignatureKind::Add { fee_recipient, oracle_feed_signer: Address::ZERO },
             );
 
             // Generate signature from a completely different key
@@ -3204,7 +3377,7 @@ mod tests {
                 validator,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add { fee_recipient },
+                SignatureKind::Add { fee_recipient, oracle_feed_signer: Address::ZERO },
             );
 
             vc.storage.set_block_number(200);
@@ -3216,6 +3389,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     fee_recipient,
+                    Address::ZERO,
                     wrong_sig,
                 ),
             );
@@ -3255,6 +3429,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     fee_recipient,
+                    Address::ZERO,
                     sig,
                 ),
             );
@@ -3334,7 +3509,7 @@ mod tests {
                 validator,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add { fee_recipient },
+                SignatureKind::Add { fee_recipient, oracle_feed_signer: Address::ZERO },
             );
 
             vc.storage.set_block_number(200);
@@ -3346,6 +3521,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     fee_recipient,
+                    Address::ZERO,
                     vec![0xde, 0xad],
                 ),
             );
@@ -3410,9 +3586,7 @@ mod tests {
                 validator,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add {
-                    fee_recipient: validator,
-                },
+                SignatureKind::Add { fee_recipient: validator, oracle_feed_signer: Address::ZERO },
             );
 
             vc.storage.set_block_number(100);
@@ -3424,6 +3598,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     validator,
+                    Address::ZERO,
                     signature,
                 ),
             )?;
@@ -3435,6 +3610,7 @@ mod tests {
                     ingress: "192.168.1.1:8000".to_string(),
                     egress: "192.168.1.1".to_string(),
                     feeRecipient: validator,
+                    oracleFeedSigner: Address::ZERO,
                 },
             )]);
 
@@ -3518,9 +3694,7 @@ mod tests {
                 validator,
                 "192.168.1.1:8000",
                 "192.168.1.1",
-                SignatureKind::Add {
-                    fee_recipient: validator,
-                },
+                SignatureKind::Add { fee_recipient: validator, oracle_feed_signer: Address::ZERO },
             );
 
             vc.storage.set_block_number(200);
@@ -3532,6 +3706,7 @@ mod tests {
                     "192.168.1.1:8000",
                     "192.168.1.1",
                     validator,
+                    Address::ZERO,
                     old_sig,
                 ),
             )?;

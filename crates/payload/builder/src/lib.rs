@@ -7,7 +7,8 @@ mod metrics;
 
 use crate::metrics::{InstrumentedFinishProvider, TempoPayloadBuilderMetrics};
 use alloy_consensus::{BlockHeader as _, Signed, Transaction, TxLegacy};
-use alloy_primitives::{Address, U256};
+use alloy_primitives::{Address, B256, U256};
+use alloy_sol_types::SolCall;
 use alloy_rlp::{Decodable, Encodable};
 use either::Either;
 use reth_basic_payload_builder::{
@@ -26,7 +27,9 @@ use reth_evm::{
 use reth_execution_types::BlockExecutionOutput;
 use reth_payload_builder::{EthBuiltPayload, PayloadBuilderError};
 use reth_payload_primitives::{BuiltPayload, BuiltPayloadExecutedBlock, PayloadBuilderAttributes};
-use reth_primitives_traits::{Recovered, transaction::error::InvalidTransactionError};
+use reth_primitives_traits::{
+    Recovered, transaction::TxHashRef, transaction::error::InvalidTransactionError,
+};
 use reth_revm::{
     State,
     context::{Block, BlockEnv},
@@ -34,10 +37,11 @@ use reth_revm::{
 };
 use reth_storage_api::{StateProvider, StateProviderFactory};
 use reth_transaction_pool::{
-    BestTransactions, BestTransactionsAttributes, TransactionPool, ValidPoolTransaction,
-    error::InvalidPoolTransactionError,
+    BestTransactions, BestTransactionsAttributes, PoolTransaction, TransactionPool,
+    ValidPoolTransaction, error::InvalidPoolTransactionError,
 };
 use std::{
+    collections::HashSet,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -46,6 +50,7 @@ use std::{
 };
 use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardforks};
 use tempo_consensus::TEMPO_SHARED_GAS_DIVISOR;
+use tempo_contracts::precompiles::{ITempoOracle, TEMPO_ORACLE_ADDRESS};
 use tempo_evm::{TempoEvmConfig, TempoNextBlockEnvAttributes};
 use tempo_payload_types::{TempoBuiltPayload, TempoPayloadBuilderAttributes};
 use tempo_primitives::{
@@ -61,6 +66,23 @@ use tempo_transaction_pool::{
     transaction::{TempoPoolTransactionError, TempoPooledTransaction},
 };
 use tracing::{Level, debug, debug_span, error, info, instrument, trace, warn};
+
+/// Classifies TempoOracle top-of-block txs for logging (`updatePriceFeed` vs `setPriceFeed`).
+fn tempo_oracle_bundle_tx_kind(tx: &Recovered<TempoTxEnvelope>) -> &'static str {
+    use Transaction as _;
+    let inner = tx.inner();
+    if inner.to() != Some(TEMPO_ORACLE_ADDRESS) || inner.input().len() < 4 {
+        return "non_tempo_oracle";
+    }
+    let sel = &inner.input()[0..4];
+    if sel == ITempoOracle::updatePriceFeedCall::SELECTOR {
+        "updatePriceFeed"
+    } else if sel == ITempoOracle::setPriceFeedCall::SELECTOR {
+        "setPriceFeed"
+    } else {
+        "tempo_oracle_other"
+    }
+}
 
 /// Returns true if a subblock has any expired transactions for the given timestamp.
 fn has_expired_transactions(subblock: &RecoveredSubBlock, timestamp: u64) -> bool {
@@ -367,6 +389,110 @@ where
             .record(prepare_system_txs_elapsed);
 
         let base_fee = builder.evm_mut().block().basefee;
+
+        // T2+: top-of-block TempoOracle bundle before pool transactions (protocol order).
+        let oracle_txs_start = Instant::now();
+        let oracle_txs = if chain_spec.is_t2_active_at_timestamp(attributes.timestamp()) {
+            let txs = attributes.oracle_txs();
+            if !txs.is_empty() {
+                info!(
+                    count = txs.len(),
+                    "tempo_payload_builder: executing oracle top-of-block bundle"
+                );
+            }
+            txs
+        } else {
+            Vec::new()
+        };
+        let mut oracle_bundle_tx_count = 0f64;
+        let mut oracle_bundle_hashes: HashSet<B256> = HashSet::new();
+        for oracle_tx in oracle_txs {
+            if cancel.is_cancelled() {
+                return Ok(BuildOutcome::Cancelled);
+            }
+            if attributes.is_interrupted() {
+                break;
+            }
+
+            let inner = oracle_tx.inner();
+            let gas_limit = oracle_tx.gas_limit();
+            let kind = tempo_oracle_bundle_tx_kind(&oracle_tx);
+            if cumulative_gas_used + gas_limit > non_shared_gas_limit {
+                warn!(
+                    tx_hash = %oracle_tx.tx_hash(),
+                    kind,
+                    "tempo_payload_builder: skipping remaining oracle txs — non-shared gas limit"
+                );
+                break;
+            }
+
+            let is_payment = oracle_tx.is_payment_v2();
+            if !is_payment && non_payment_gas_used + gas_limit > general_gas_limit {
+                warn!(
+                    tx_hash = %oracle_tx.tx_hash(),
+                    kind,
+                    "tempo_payload_builder: skipping remaining oracle txs — general gas limit"
+                );
+                break;
+            }
+
+            let tx_rlp_length = inner.length();
+            let estimated_block_size_with_tx = block_size_used + tx_rlp_length;
+            if is_osaka && estimated_block_size_with_tx > MAX_RLP_BLOCK_SIZE {
+                warn!(
+                    tx_hash = %oracle_tx.tx_hash(),
+                    kind,
+                    "tempo_payload_builder: skipping remaining oracle txs — max RLP block size"
+                );
+                break;
+            }
+
+            let effective_gas_price = Transaction::effective_gas_price(inner, Some(base_fee));
+            let tx_execution_start = Instant::now();
+            let gas_used = match builder.execute_transaction(oracle_tx.clone()) {
+                Ok(gas_used) => {
+                    info!(
+                        tx_hash = %oracle_tx.tx_hash(),
+                        kind,
+                        gas_used,
+                        "tempo_payload_builder: oracle top-of-block tx executed OK"
+                    );
+                    gas_used
+                }
+                Err(err) => {
+                    warn!(
+                        tx_hash = %oracle_tx.tx_hash(),
+                        kind,
+                        %err,
+                        "tempo_payload_builder: oracle top-of-block tx failed; aborting payload build"
+                    );
+                    self.metrics.inc_build_failure("oracle_txs_invalid_tx");
+                    return Err(PayloadBuilderError::evm(err));
+                }
+            };
+            self.metrics
+                .transaction_execution_duration_seconds
+                .record(tx_execution_start.elapsed());
+
+            oracle_bundle_hashes.insert(*oracle_tx.tx_hash());
+            total_fees += calc_gas_balance_spending(gas_used, effective_gas_price);
+            cumulative_gas_used += gas_used;
+            if !is_payment {
+                non_payment_gas_used += gas_used;
+            }
+            block_size_used += tx_rlp_length;
+            if is_payment {
+                payment_transactions += 1;
+            }
+            oracle_bundle_tx_count += 1.0;
+        }
+        self.metrics
+            .oracle_txs_duration_seconds
+            .record(oracle_txs_start.elapsed());
+        self.metrics
+            .oracle_txs_transaction_count
+            .record(oracle_bundle_tx_count);
+
         let pool_fetch_start = Instant::now();
         let mut best_txs = best_txs(BestTransactionsAttributes::new(
             base_fee,
@@ -383,6 +509,17 @@ where
         let execution_start = Instant::now();
         let _block_fill_span = debug_span!(target: "payload_builder", "block_fill").entered();
         while let Some(pool_tx) = best_txs.next() {
+            if oracle_bundle_hashes.contains(pool_tx.transaction.hash()) {
+                best_txs.mark_invalid(
+                    &pool_tx,
+                    &InvalidPoolTransactionError::Other(Box::new(
+                        TempoPoolTransactionError::OracleTopOfBlockDuplicate,
+                    )),
+                );
+                self.metrics.inc_pool_tx_skipped("oracle_txs_duplicate");
+                continue;
+            }
+
             // Ensure we still have capacity for this transaction within the non-shared gas limit.
             // The remaining `shared_gas_limit` is reserved for validator subblocks and must not
             // be consumed by proposer's pool transactions.
@@ -851,6 +988,7 @@ mod tests {
             Address::default(),
             1000,
             extra_data.clone(),
+            Vec::new,
             Vec::new,
         );
 

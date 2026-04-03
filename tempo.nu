@@ -37,9 +37,16 @@ def port-to-node-index [port: int] {
     ($port - 8000) / 100 | into int
 }
 
-# Build log filter args based on --loud flag
-def log-filter-args [loud: bool] {
-    if $loud { [] } else { ["--log.stdout.filter" "warn"] }
+# Default stdout: warn globally, info for TempoOracle setPriceFeed commits (target tempo_precompiles::tempo_oracle).
+# (Tempo CLI rejects duplicate --log.stdout.filter; skip when the user supplies their own.)
+def log-filter-args [loud: bool, node_args_raw: string = ""] {
+    if $loud {
+        []
+    } else if ($node_args_raw | str contains "log.stdout.filter") {
+        []
+    } else {
+        ["--log.stdout.filter" "warn,tempo_precompiles::tempo_oracle=info"]
+    }
 }
 
 # Wrap command with samply if enabled
@@ -377,7 +384,7 @@ def run-bench-single [
     # Build node arguments
     let args = (build-base-args $genesis_path $datadir $log_dir "0.0.0.0" 8545 9001)
         | append (build-dev-args)
-        | append (log-filter-args $loud)
+        | append (log-filter-args $loud $node_args)
         | append $extra_args
 
     # Start tempo node in background
@@ -755,12 +762,18 @@ def "main localnet" [
     --profile: string = $DEFAULT_PROFILE # Cargo build profile
     --features: string = $DEFAULT_FEATURES # Cargo features
     --loud                      # Show all node logs (WARN/ERROR shown by default)
-    --node-args: string = ""    # Additional node arguments (space-separated)
+    --node-args: string = ""    # Additional node arguments (space-separated). If a value starts with "-", use --node-args='--flag ...' (equals form) so Nushell does not treat it as a new flag.
     --skip-build                # Skip building (assumes binary is already built)
     --force                     # Kill dangling processes without prompting
     --bloat: int = 0            # Generate state bloat (size in MiB) for TIP20 tokens
+    --oracle-localnet           # Consensus: genesis KRW/USD oracle + per-validator oracle.toml / evm_oracle.hex + node flags
 ] {
     validate-mode $mode
+
+    if $mode == "dev" and $oracle_localnet {
+        print "Error: --oracle-localnet requires --mode consensus"
+        exit 1
+    }
 
     # Check for dangling processes or stale IPC socket
     let pids = (find-tempo-pids)
@@ -783,9 +796,9 @@ def "main localnet" [
             print "Error: --nodes is only valid with --mode consensus"
             exit 1
         }
-        run-dev-node $accounts $genesis $samply $samply_args_list $reset $profile $loud $extra_args $bloat
+        run-dev-node $accounts $genesis $samply $samply_args_list $reset $profile $loud $extra_args $bloat $node_args
     } else {
-        run-consensus-nodes $nodes $accounts $genesis $samply $samply_args_list $reset $profile $loud $extra_args $bloat
+        run-consensus-nodes $nodes $accounts $genesis $samply $samply_args_list $reset $profile $loud $extra_args $bloat $oracle_localnet $node_args
     }
 }
 
@@ -793,7 +806,7 @@ def "main localnet" [
 # Dev mode
 # ============================================================================
 
-def run-dev-node [accounts: int, genesis: string, samply: bool, samply_args: list<string>, reset: bool, profile: string, loud: bool, extra_args: list<string>, bloat: int] {
+def run-dev-node [accounts: int, genesis: string, samply: bool, samply_args: list<string>, reset: bool, profile: string, loud: bool, extra_args: list<string>, bloat: int, node_args_raw: string] {
     let tempo_bin = if $profile == "dev" {
         "./target/debug/tempo"
     } else {
@@ -836,7 +849,7 @@ def run-dev-node [accounts: int, genesis: string, samply: bool, samply_args: lis
 
     let args = (build-base-args $genesis_path $datadir $log_dir "0.0.0.0" 8545 9001)
         | append (build-dev-args)
-        | append (log-filter-args $loud)
+        | append (log-filter-args $loud $node_args_raw)
         | append $extra_args
 
     let cmd = wrap-samply [$tempo_bin ...$args] $samply $samply_args
@@ -854,6 +867,8 @@ def build-base-args [genesis_path: string, datadir: string, log_dir: string, bin
         "--http.addr" $bind_ip
         "--http.port" $"($http_port)"
         "--http.api" "all"
+        "--ipcpath" $"($datadir)/reth.ipc"
+        "--auth-ipc.path" $"($datadir)/reth_engine_api.ipc"
         "--metrics" $"($bind_ip):($reth_metrics_port)"
         "--log.file.directory" $log_dir
         "--faucet.enabled"
@@ -879,7 +894,7 @@ def build-dev-args [] {
 # Consensus mode
 # ============================================================================
 
-def run-consensus-nodes [nodes: int, accounts: int, genesis: string, samply: bool, samply_args: list<string>, reset: bool, profile: string, loud: bool, extra_args: list<string>, bloat: int] {
+def run-consensus-nodes [nodes: int, accounts: int, genesis: string, samply: bool, samply_args: list<string>, reset: bool, profile: string, loud: bool, extra_args: list<string>, bloat: int, oracle_localnet: bool, node_args_raw: string] {
     # Check if we need to generate localnet (only if no custom genesis provided)
     if $genesis == "" {
         let needs_generation = $reset or (not ($LOCALNET_DIR | path exists)) or (
@@ -894,12 +909,16 @@ def run-consensus-nodes [nodes: int, accounts: int, genesis: string, samply: boo
             }
             rm -rf $LOCALNET_DIR
 
-            # Generate validator addresses with distinct loopback IPs (required by ValidatorConfigV2
-            # ingress uniqueness check which is per-IP, not per-socket-address)
-            let validators = (0..<$nodes | each { |i| $"127.0.0.($i + 1):($i * 100 + 8000)" } | str join ",")
+            # Distinct ingress is full `ip:port` (ValidatorConfigV2); same loopback IP with different
+            # ports is valid and avoids macOS `sudo ifconfig lo0 alias` for 127.0.0.2, etc.
+            let validators = (0..<$nodes | each { |i| $"127.0.0.1:($i * 100 + 8000)" } | str join ",")
 
             print $"Generating localnet with ($accounts) accounts and ($nodes) validators..."
-            cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $LOCALNET_DIR --accounts $accounts --validators $validators --force | ignore
+            if $oracle_localnet {
+                cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $LOCALNET_DIR --accounts $accounts --validators $validators --force --oracle-currencies 410 --oracle-currencies 392 --oracle-currencies 978 --oracle-registry-admin 0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266 --oracle-fund-signers $nodes | ignore
+            } else {
+                cargo run -p tempo-xtask --profile $profile -- generate-localnet -o $LOCALNET_DIR --accounts $accounts --validators $validators --force | ignore
+            }
         }
     }
 
@@ -917,6 +936,11 @@ def run-consensus-nodes [nodes: int, accounts: int, genesis: string, samply: boo
     } | str join ",")
 
     print $"Found ($validator_dirs | length) validator configs"
+
+    if $oracle_localnet {
+        cargo run -p tempo-xtask --profile $profile -- prepare-oracle-localnet --localnet-dir $LOCALNET_DIR | ignore
+        print $"Oracle: setPriceFeed logs one info line per pair; tracing target tempo_precompiles::tempo_oracle. Default stdout filter includes tempo_precompiles::tempo_oracle=info; also see ($LOGS_DIR)/<addr>/reth.log. Override with --node-args and --log.stdout.filter, or use localnet --loud."
+    }
 
     let tempo_bin = if $profile == "dev" {
         "./target/debug/tempo"
@@ -959,11 +983,11 @@ def run-consensus-nodes [nodes: int, accounts: int, genesis: string, samply: boo
     let background_nodes = $validator_dirs | skip 1
 
     for node in $background_nodes {
-        run-consensus-node $node $genesis_path $trusted_peers $tempo_bin $loud false [] $extra_args true
+        run-consensus-node $node $genesis_path $trusted_peers $tempo_bin $loud false [] $extra_args $oracle_localnet $node_args_raw true
     }
 
     # Run node 0 in foreground (receives Ctrl+C directly)
-    run-consensus-node $foreground_node $genesis_path $trusted_peers $tempo_bin $loud $samply $samply_args $extra_args false
+    run-consensus-node $foreground_node $genesis_path $trusted_peers $tempo_bin $loud $samply $samply_args $extra_args $oracle_localnet $node_args_raw false
 }
 
 # Run a single consensus node (foreground or background)
@@ -976,6 +1000,8 @@ def run-consensus-node [
     samply: bool
     samply_args: list<string>
     extra_args: list<string>
+    oracle_localnet: bool
+    node_args_raw: string
     background: bool
 ] {
     let addr = ($node_dir | path basename)
@@ -986,8 +1012,8 @@ def run-consensus-node [
     let log_dir = $"($LOGS_DIR)/($addr)"
     mkdir $log_dir
 
-    let args = (build-consensus-node-args $node_dir $genesis_path $trusted_peers $port $log_dir)
-        | append (log-filter-args $loud)
+    let args = (build-consensus-node-args $node_dir $genesis_path $trusted_peers $port $log_dir $oracle_localnet)
+        | append (log-filter-args $loud $node_args_raw)
         | append $extra_args
 
     let cmd = wrap-samply [$tempo_bin ...$args] $samply $samply_args
@@ -1003,17 +1029,17 @@ def run-consensus-node [
 }
 
 # Build full node arguments for consensus mode
-def build-consensus-node-args [node_dir: string, genesis_path: string, trusted_peers: string, port: int, log_dir: string] {
+def build-consensus-node-args [node_dir: string, genesis_path: string, trusted_peers: string, port: int, log_dir: string, oracle_localnet: bool] {
     let node_index = (port-to-node-index $port)
     let http_port = 8545 + $node_index
     let reth_metrics_port = 9001 + $node_index
 
     (build-base-args $genesis_path $node_dir $log_dir "0.0.0.0" $http_port $reth_metrics_port)
-        | append (build-consensus-args $node_dir $trusted_peers $port)
+        | append (build-consensus-args $node_dir $trusted_peers $port $oracle_localnet)
 }
 
 # Build consensus mode specific arguments
-def build-consensus-args [node_dir: string, trusted_peers: string, port: int] {
+def build-consensus-args [node_dir: string, trusted_peers: string, port: int, oracle_localnet: bool] {
     let addr = ($node_dir | path basename)
     let ip = ($addr | split row ":" | get 0)
     let signing_key = $"($node_dir)/signing.key"
@@ -1024,6 +1050,15 @@ def build-consensus-args [node_dir: string, trusted_peers: string, port: int] {
     let metrics_port = $port + 2
     let authrpc_port = $port + 3
     let discv5_port = $port + 4
+
+    let oracle_args = if $oracle_localnet {
+        [
+            "--consensus.oracle-config" $"($node_dir)/oracle.toml"
+            "--consensus.evm-signing-key" $"($node_dir)/evm_oracle.hex"
+        ]
+    } else {
+        []
+    }
 
     [
         "--consensus.signing-key" $signing_key
@@ -1039,7 +1074,7 @@ def build-consensus-args [node_dir: string, trusted_peers: string, port: int] {
         "--consensus.fee-recipient" "0x0000000000000000000000000000000000000000"
         "--consensus.use-local-defaults"
         "--consensus.bypass-ip-check"
-    ]
+    ] | append $oracle_args
 }
 
 # ============================================================================
@@ -1957,7 +1992,7 @@ tempo-precompiles = { path = '($tempo_root)/crates/precompiles' }
             rm -rf $datadir
             let args = (build-base-args $genesis_path $datadir $log_dir "0.0.0.0" 8545 9001)
                 | append (build-dev-args)
-                | append ["--log.stdout.filter" "warn"]
+                | append ["--log.stdout.filter" "warn,tempo_precompiles::tempo_oracle=info"]
                 | append [
                     "--faucet.address" "0x20c0000000000000000000000000000000000002"
                     "--faucet.address" "0x20c0000000000000000000000000000000000003"
@@ -2133,6 +2168,7 @@ def main [] {
     print "  nu tempo.nu localnet --mode dev --samply --accounts 50000 --reset"
     print "  nu tempo.nu localnet --mode dev --bloat 1024 --reset"
     print "  nu tempo.nu localnet --mode consensus --nodes 3"
+    print "  nu tempo.nu localnet --mode consensus --nodes 3 --oracle-localnet --reset"
     print ""
     print "Port assignments (consensus mode, per node N=0,1,2...):"
     print "  Consensus:     8000 + N*100"

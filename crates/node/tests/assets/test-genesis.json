@@ -26,6 +26,9 @@
     "t1bTime": 0,
     "t1cTime": 0,
     "t2Time": 0,
+    "oracleMaxDeviationBps": 0,
+    "oracleFeedThresholdNum": 2,
+    "oracleFeedThresholdDen": 3,
     "depositContractAddress": "0x0000000000000000000000000000000000000000"
   },
   "nonce": "0x42",
@@ -1754,6 +1757,11 @@
       "code": "0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3"
     },
     "0xaaaaaaaa00000000000000000000000000000000": {
+      "nonce": "0x0",
+      "balance": "0x0",
+      "code": "0xef"
+    },
+    "0x0acc010000000000000000000000000000000000": {
       "nonce": "0x0",
       "balance": "0x0",
       "code": "0xef"

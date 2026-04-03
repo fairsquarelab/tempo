@@ -27,6 +27,8 @@ crate::sol! {
             string ingress;
             string egress;
             address feeRecipient;
+            /// EOA that may call TempoOracle `updatePriceFeed`; `address(0)` means use `validatorAddress`.
+            address oracleFeedSigner;
             uint64 index;
             uint64 addedAtHeight;
             uint64 deactivatedAtHeight;
@@ -74,6 +76,7 @@ crate::sol! {
             string calldata ingress,
             string calldata egress,
             address feeRecipient,
+            address oracleFeedSigner,
             bytes calldata signature
         ) external returns (uint64 index);
 
@@ -124,7 +127,7 @@ crate::sol! {
         // Events
         // =====================================================================
 
-        event ValidatorAdded(uint64 indexed index, address indexed validatorAddress, bytes32 publicKey, string ingress, string egress, address feeRecipient);
+        event ValidatorAdded(uint64 indexed index, address indexed validatorAddress, bytes32 publicKey, string ingress, string egress, address feeRecipient, address oracleFeedSigner);
         event ValidatorDeactivated(uint64 indexed index, address indexed validatorAddress);
         event ValidatorRotated(
             uint64 indexed index,
@@ -167,6 +170,7 @@ crate::sol! {
         error AddressAlreadyHasValidator();
         error ValidatorAlreadyDeactivated();
         error ValidatorNotFound();
+        error OracleFeedSignerAlreadyInUse();
     }
 }
 
@@ -241,5 +245,9 @@ impl ValidatorConfigV2Error {
 
     pub fn ingress_already_exists(ingress: String) -> Self {
         Self::IngressAlreadyExists(IValidatorConfigV2::IngressAlreadyExists { ingress })
+    }
+
+    pub const fn oracle_feed_signer_already_in_use() -> Self {
+        Self::OracleFeedSignerAlreadyInUse(IValidatorConfigV2::OracleFeedSignerAlreadyInUse {})
     }
 }

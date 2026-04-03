@@ -38,7 +38,7 @@ use crate::{
     consensus::application,
     dkg,
     epoch::{self, SchemeProvider},
-    peer_manager, subblocks,
+    oracle_price_feed, peer_manager, subblocks,
 };
 
 use super::block::Block;
@@ -95,6 +95,9 @@ pub struct Builder<TBlocker, TPeerManager> {
     pub subblock_broadcast_interval: Duration,
     pub fcu_heartbeat_interval: Duration,
     pub with_subblocks: bool,
+
+    pub evm_signer: Option<alloy_signer_local::PrivateKeySigner>,
+    pub oracle_config: Option<crate::oracle_price_feed::config::OracleConfig>,
 
     pub feed_state: crate::feed::FeedStateHandle,
 }
@@ -324,6 +327,18 @@ where
             priority_responses: false,
         };
 
+        let oracle_price_feed = oracle_price_feed::Actor::new(oracle_price_feed::Config {
+            context: context.clone(),
+            signer: self.signer.clone(),
+            evm_signer: self.evm_signer.clone(),
+            fee_recipient: self.fee_recipient,
+            scheme_provider: scheme_provider.clone(),
+            node: execution_node.clone(),
+            epoch_strategy: epoch_strategy.clone(),
+            oracle_config: self.oracle_config.clone(),
+        });
+        let oracle_price_feed_mailbox = oracle_price_feed.mailbox();
+
         let subblocks = self.with_subblocks.then(|| {
             subblocks::Actor::new(subblocks::Config {
                 context: context.clone(),
@@ -357,6 +372,7 @@ where
             subblocks: subblocks.as_ref().map(|s| s.mailbox()),
             scheme_provider: scheme_provider.clone(),
             epoch_strategy: epoch_strategy.clone(),
+            oracle_price_feed: oracle_price_feed_mailbox.clone(),
         })
         .await
         .wrap_err("failed initializing application actor")?;
@@ -372,6 +388,7 @@ where
                 time_to_propose: self.time_to_propose,
                 mailbox_size: self.mailbox_size,
                 subblocks: subblocks.as_ref().map(|s| s.mailbox()),
+                oracle_price_feed: oracle_price_feed_mailbox.clone(),
                 marshal: marshal_mailbox.clone(),
                 feed: feed_mailbox.clone(),
                 scheme_provider: scheme_provider.clone(),
@@ -426,6 +443,8 @@ where
             feed,
 
             subblocks,
+
+            oracle_price_feed,
         })
     }
 }
@@ -481,6 +500,8 @@ where
     feed: crate::feed::Actor<TContext>,
 
     subblocks: Option<subblocks::Actor<TContext>>,
+
+    oracle_price_feed: oracle_price_feed::Actor<TContext>,
 }
 
 impl<TContext, TBlocker, TPeerManager> Engine<TContext, TBlocker, TPeerManager>
@@ -532,6 +553,10 @@ where
             impl Sender<PublicKey = PublicKey>,
             impl Receiver<PublicKey = PublicKey>,
         ),
+        oracle_price_feed_channel: (
+            impl Sender<PublicKey = PublicKey>,
+            impl Receiver<PublicKey = PublicKey>,
+        ),
     ) -> Handle<eyre::Result<()>> {
         spawn_cell!(
             self.context,
@@ -543,6 +568,7 @@ where
                 marshal_network,
                 dkg_channel,
                 subblocks_channel,
+                oracle_price_feed_channel,
             )
             .await
         )
@@ -582,6 +608,10 @@ where
             impl Sender<PublicKey = PublicKey>,
             impl Receiver<PublicKey = PublicKey>,
         ),
+        oracle_price_feed_channel: (
+            impl Sender<PublicKey = PublicKey>,
+            impl Receiver<PublicKey = PublicKey>,
+        ),
     ) -> eyre::Result<()> {
         let peer_manager = self.peer_manager.start();
 
@@ -612,6 +642,12 @@ where
 
         let dkg_manager = self.dkg_manager.start(dkg_channel);
 
+        let oracle_actor = self.oracle_price_feed;
+        let oracle_price_feed_task = self
+            .context
+            .clone()
+            .spawn(move |_| oracle_actor.run(oracle_price_feed_channel));
+
         let mut tasks = vec![
             application,
             broadcast,
@@ -621,6 +657,7 @@ where
             marshal,
             dkg_manager,
             peer_manager,
+            oracle_price_feed_task,
         ];
 
         if let Some(subblocks) = self.subblocks {

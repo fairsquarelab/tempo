@@ -50,9 +50,14 @@ impl ValidatorConfig {
     }
 
     /// Returns the message hash for `addValidator`
-    pub fn add_validator_message_hash(&self, fee_recipient: Address) -> B256 {
+    pub fn add_validator_message_hash(
+        &self,
+        fee_recipient: Address,
+        oracle_feed_signer: Address,
+    ) -> B256 {
         let mut hasher = self.base_hasher();
         hasher.update(fee_recipient.as_slice());
+        hasher.update(oracle_feed_signer.as_slice());
         hasher.finalize()
     }
 
@@ -65,9 +70,10 @@ impl ValidatorConfig {
     pub fn check_add_validator_signature(
         &self,
         fee_recipient: Address,
+        oracle_feed_signer: Address,
         signature: &[u8],
     ) -> Result<(), ValidatorConfigError> {
-        let message = self.add_validator_message_hash(fee_recipient);
+        let message = self.add_validator_message_hash(fee_recipient, oracle_feed_signer);
         self.check_signature(VALIDATOR_NS_ADD, &message, signature)
     }
 

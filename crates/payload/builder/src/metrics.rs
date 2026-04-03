@@ -45,6 +45,10 @@ pub(crate) struct TempoPayloadBuilderMetrics {
     pub(crate) pool_fetch_duration_seconds: Histogram,
     /// Time to acquire the state provider and initialize the state DB.
     pub(crate) state_setup_duration_seconds: Histogram,
+    /// Time spent executing top-of-block TempoOracle bundle txs (T2+).
+    pub(crate) oracle_txs_duration_seconds: Histogram,
+    /// Number of txs executed in the oracle top-of-block bundle.
+    pub(crate) oracle_txs_transaction_count: Histogram,
     /// The time it took to prepare system transactions in seconds.
     pub(crate) prepare_system_transactions_duration_seconds: Histogram,
     /// The time it took to execute one transaction in seconds.

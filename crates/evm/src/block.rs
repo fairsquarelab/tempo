@@ -1,5 +1,8 @@
 use crate::{TempoBlockExecutionCtx, evm::TempoEvm};
-use alloy_consensus::{Transaction, transaction::TxHashRef};
+use alloy_consensus::{
+    Transaction,
+    transaction::{SignerRecoverable, TxHashRef},
+};
 use alloy_evm::{
     Database, Evm, RecoveredTx,
     block::{
@@ -13,6 +16,7 @@ use alloy_evm::{
 };
 use alloy_primitives::{Address, B256, U256};
 use alloy_rlp::Decodable;
+use alloy_sol_types::SolCall;
 use commonware_codec::DecodeExt;
 use commonware_cryptography::{
     Verifier,
@@ -27,7 +31,9 @@ use reth_revm::{
 };
 use std::collections::{HashMap, HashSet};
 use tempo_chainspec::{TempoChainSpec, hardfork::TempoHardforks};
-use tempo_contracts::precompiles::VALIDATOR_CONFIG_V2_ADDRESS;
+use tempo_contracts::precompiles::{
+    ITempoOracle, TEMPO_ORACLE_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
+};
 use tempo_primitives::{
     SubBlock, SubBlockMetadata, TempoReceipt, TempoTxEnvelope, TempoTxType,
     subblock::PartialValidatorKey,
@@ -37,6 +43,10 @@ use tracing::trace;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum BlockSection {
+    /// Initial section. When T2 is active, allows oracle transactions (`updatePriceFeed*` followed
+    /// by `setPriceFeed`). Non-oracle transactions (or T2 inactive) fall through to
+    /// [`BlockSection::StartOfBlock`] logic.
+    Oracle,
     /// Start of block system transactions.
     StartOfBlock,
     /// Basic section of the block. Includes arbitrary transactions chosen by the proposer.
@@ -146,7 +156,7 @@ where
                 chain_spec,
                 TempoReceiptBuilder::default(),
             ),
-            section: BlockSection::StartOfBlock,
+            section: BlockSection::Oracle,
             seen_subblocks: Vec::new(),
             subblock_fee_recipients: ctx.subblock_fee_recipients,
         }
@@ -207,6 +217,78 @@ where
         Ok(BlockSection::System {
             seen_subblocks_signatures,
         })
+    }
+
+    /// Validates a transaction while in [`BlockSection::Oracle`].
+    ///
+    /// When T2 is not yet active or the transaction is not addressed to the oracle, falls through
+    /// to [`StartOfBlock`][BlockSection::StartOfBlock] logic via [`Self::validate_start_of_block_tx`].
+    fn validate_oracle_tx(
+        &self,
+        tx: &TempoTxEnvelope,
+        gas_used: u64,
+    ) -> Result<BlockSection, BlockValidationError> {
+        let timestamp = self.evm().block().timestamp.to::<u64>();
+        if !self.inner.spec.is_t2_active_at_timestamp(timestamp)
+            || tx.to() != Some(TEMPO_ORACLE_ADDRESS)
+        {
+            return self.validate_start_of_block_tx(tx, gas_used);
+        }
+
+        let input = tx.input();
+        if input.len() < 4 {
+            return Err(BlockValidationError::msg("oracle tx: calldata too short"));
+        }
+        let sel: [u8; 4] = input[0..4].try_into().expect("length checked");
+
+        if sel == ITempoOracle::updatePriceFeedCall::SELECTOR {
+            Ok(BlockSection::Oracle)
+        } else if sel == ITempoOracle::setPriceFeedCall::SELECTOR {
+            self.validate_set_price_feed_tx(tx)
+        } else {
+            Err(BlockValidationError::msg(
+                "only updatePriceFeed / setPriceFeed allowed in oracle section",
+            ))
+        }
+    }
+
+    /// Validates a `setPriceFeed` transaction: checks calldata length and that it is signed by
+    /// the block beneficiary (leader). Quorum enforcement is delegated to the precompile.
+    fn validate_set_price_feed_tx(
+        &self,
+        tx: &TempoTxEnvelope,
+    ) -> Result<BlockSection, BlockValidationError> {
+        if tx.input().len() != 4 {
+            return Err(BlockValidationError::msg(
+                "setPriceFeed must have empty calldata after selector",
+            ));
+        }
+        let beneficiary = self.evm().block().beneficiary;
+        let signer = tx
+            .recover_signer()
+            .map_err(|_| BlockValidationError::msg("failed to recover setPriceFeed signer"))?;
+        if signer != beneficiary {
+            return Err(BlockValidationError::msg(
+                "setPriceFeed must be signed by block beneficiary (leader)",
+            ));
+        }
+        Ok(BlockSection::StartOfBlock)
+    }
+
+    /// Validates a transaction for the [`BlockSection::StartOfBlock`] / [`BlockSection::NonShared`]
+    /// case (shared gas / non-payment gas checks).
+    fn validate_start_of_block_tx(
+        &self,
+        tx: &TempoTxEnvelope,
+        gas_used: u64,
+    ) -> Result<BlockSection, BlockValidationError> {
+        if gas_used > self.non_shared_gas_left
+            || (!tx.is_payment_v1() && gas_used > self.non_payment_gas_left)
+        {
+            Ok(BlockSection::GasIncentive)
+        } else {
+            Ok(BlockSection::NonShared)
+        }
     }
 
     pub(crate) fn validate_shared_gas(
@@ -306,7 +388,7 @@ where
                 BlockSection::GasIncentive | BlockSection::System { .. } => {
                     Err(BlockValidationError::msg("subblock section already passed"))
                 }
-                BlockSection::StartOfBlock | BlockSection::NonShared => {
+                BlockSection::Oracle | BlockSection::StartOfBlock | BlockSection::NonShared => {
                     Ok(BlockSection::SubBlock {
                         proposer: tx_proposer,
                     })
@@ -327,6 +409,7 @@ where
             }
         } else {
             match self.section {
+                BlockSection::Oracle => self.validate_oracle_tx(tx, gas_used),
                 BlockSection::StartOfBlock | BlockSection::NonShared => {
                     if gas_used > self.non_shared_gas_left
                         || (!tx.is_payment_v1() && gas_used > self.non_payment_gas_left)
@@ -369,9 +452,9 @@ where
     fn apply_pre_execution_changes(&mut self) -> Result<(), alloy_evm::block::BlockExecutionError> {
         self.inner.apply_pre_execution_changes()?;
 
-        // Deploy 0xEF marker bytecode to ValidatorConfigV2 when T2 activates.
         let timestamp = self.evm().block().timestamp.to::<u64>();
         if self.inner.spec.is_t2_active_at_timestamp(timestamp) {
+            // Deploy 0xEF marker bytecode to ValidatorConfigV2 when T2 activates.
             let db = self.evm_mut().ctx_mut().journaled_state.db_mut();
             let mut info = db
                 .basic(VALIDATOR_CONFIG_V2_ADDRESS)
@@ -457,6 +540,9 @@ where
         self.section = next_section;
 
         match self.section {
+            BlockSection::Oracle => {
+                // no gas accounting for oracle transactions
+            }
             BlockSection::StartOfBlock => {
                 // no gas spending for start-of-block system transactions
             }

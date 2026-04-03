@@ -12,7 +12,10 @@
 
 use std::{iter::repeat_with, net::SocketAddr, time::Duration};
 
-use alloy::signers::k256::schnorr::CryptoRngCore;
+use alloy::signers::{
+    k256::schnorr::CryptoRngCore,
+    local::{MnemonicBuilder, PrivateKeySigner},
+};
 use alloy_primitives::Address;
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{
@@ -35,7 +38,9 @@ use commonware_utils::{N3f1, TryFromIterator as _, ordered};
 use futures::future::join_all;
 use itertools::Itertools as _;
 use reth_node_metrics::recorder::PrometheusRecorder;
-use tempo_commonware_node::{consensus, feed::FeedStateHandle};
+use tempo_commonware_node::{
+    consensus, feed::FeedStateHandle, oracle_price_feed::config::OracleConfig,
+};
 
 pub mod execution_runtime;
 pub use execution_runtime::ExecutionNodeConfig;
@@ -87,6 +92,18 @@ fn generate_consensus_node_config(
             .enumerate()
             .map(|(i, private_key)| {
                 let public_key = private_key.public_key();
+                // Deterministic secp256k1 keys from the same test mnemonic as execution genesis,
+                // so `launch()` can pre-fund `evm_signing_key.address()` reliably.
+                let evm_mnemonic_index =
+                    crate::execution_runtime::ORACLE_EVM_MNEMONIC_BASE + i as u32;
+                let evm_sk = MnemonicBuilder::from_phrase_nth(
+                    crate::execution_runtime::TEST_MNEMONIC,
+                    evm_mnemonic_index,
+                )
+                .credential()
+                .to_bytes();
+                let evm_signing_key = PrivateKeySigner::from_slice(&evm_sk)
+                    .expect("mnemonic-derived secp256k1 secret must be valid");
                 let config = ConsensusNodeConfig {
                     address: crate::execution_runtime::validator(i as u32),
                     ingress: SocketAddr::from(([127, 0, 0, (i + 1) as u8], 8000)),
@@ -94,6 +111,7 @@ fn generate_consensus_node_config(
                     fee_recipient: Address::ZERO,
                     private_key,
                     share: shares.get_value(&public_key).cloned(),
+                    evm_signing_key,
                 };
                 (public_key, config)
             }),
@@ -112,6 +130,7 @@ pub struct ConsensusNodeConfig {
     pub fee_recipient: Address,
     pub private_key: PrivateKey,
     pub share: Option<Share>,
+    pub evm_signing_key: PrivateKeySigner,
 }
 
 /// The test setup run by [`run`].
@@ -149,6 +168,15 @@ pub struct Setup {
 
     /// Whether to activate subblocks building.
     pub with_subblocks: bool,
+
+    /// Oracle currency IDs registered at genesis (empty = skip `with_oracle_currencies`).
+    pub oracle_currencies: Vec<u32>,
+    /// Admin for `registerCurrency` at genesis; required when `oracle_currencies` is non-empty.
+    pub oracle_registry_admin: Option<Address>,
+    /// Per-validator oracle HTTP config; index `i` matches the `i`-th entry from
+    /// `validators` iteration order (signers then verifiers). Shorter vectors leave
+    /// trailing nodes without an oracle actor config.
+    pub oracle_configs_per_validator: Vec<OracleConfig>,
 }
 
 impl Setup {
@@ -167,6 +195,9 @@ impl Setup {
             new_payload_wait_time: Duration::from_millis(300),
             t2_time: 1,
             with_subblocks: false,
+            oracle_currencies: Vec::new(),
+            oracle_registry_admin: None,
+            oracle_configs_per_validator: Vec::new(),
         }
     }
 
@@ -223,6 +254,30 @@ impl Setup {
     pub fn t2_time(self, t2_time: u64) -> Self {
         Self { t2_time, ..self }
     }
+
+    pub fn oracle_currencies(self, oracle_currencies: Vec<u32>) -> Self {
+        Self {
+            oracle_currencies,
+            ..self
+        }
+    }
+
+    pub fn oracle_registry_admin(self, oracle_registry_admin: Address) -> Self {
+        Self {
+            oracle_registry_admin: Some(oracle_registry_admin),
+            ..self
+        }
+    }
+
+    pub fn oracle_configs_per_validator(
+        self,
+        oracle_configs_per_validator: Vec<OracleConfig>,
+    ) -> Self {
+        Self {
+            oracle_configs_per_validator,
+            ..self
+        }
+    }
 }
 
 impl Default for Setup {
@@ -248,6 +303,9 @@ pub async fn setup_validators(
         new_payload_wait_time,
         t2_time,
         with_subblocks,
+        oracle_currencies,
+        oracle_registry_admin,
+        oracle_configs_per_validator,
         ..
     }: Setup,
 ) -> (Vec<TestingNode<Context>>, ExecutionRuntime) {
@@ -264,13 +322,17 @@ pub async fn setup_validators(
     let (onchain_dkg_outcome, validators) =
         generate_consensus_node_config(context, how_many_signers, how_many_verifiers);
 
-    let execution_runtime = ExecutionRuntime::builder()
+    let mut exec_builder = ExecutionRuntime::builder()
         .with_epoch_length(epoch_length)
         .with_initial_dkg_outcome(onchain_dkg_outcome)
         .with_t2_time(t2_time)
-        .with_validators(validators.clone())
-        .launch()
-        .unwrap();
+        .with_validators(validators.clone());
+    if !oracle_currencies.is_empty() {
+        let admin = oracle_registry_admin
+            .expect("Setup.oracle_registry_admin must be set when oracle_currencies is non-empty");
+        exec_builder = exec_builder.with_oracle_currencies(oracle_currencies.clone(), admin);
+    }
+    let execution_runtime = exec_builder.launch().unwrap();
 
     let execution_configs = ExecutionNodeConfig::generator()
         .with_count(how_many_signers + how_many_verifiers)
@@ -279,16 +341,19 @@ pub async fn setup_validators(
 
     let mut nodes = vec![];
 
-    for ((public_key, consensus_node_config), mut execution_config) in
-        validators.into_iter().zip_eq(execution_configs)
+    for (i, ((public_key, consensus_node_config), mut execution_config)) in
+        validators.into_iter().zip_eq(execution_configs).enumerate()
     {
         let ConsensusNodeConfig {
             address,
             ingress,
             private_key,
             share,
+            evm_signing_key,
             ..
         } = consensus_node_config;
+        let oracle_config = oracle_configs_per_validator.get(i).cloned();
+        let evm_signer = oracle_config.as_ref().map(|_| evm_signing_key.clone());
         let oracle = oracle.clone();
         let uid = format!("{CONSENSUS_NODE_PREFIX}_{public_key}");
         let feed_state = FeedStateHandle::new();
@@ -319,6 +384,8 @@ pub async fn setup_validators(
             fcu_heartbeat_interval: Duration::from_secs(3),
             feed_state,
             with_subblocks,
+            evm_signer,
+            oracle_config,
         };
 
         nodes.push(TestingNode::new(

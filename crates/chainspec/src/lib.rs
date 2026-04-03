@@ -6,4 +6,4 @@
 mod bootnodes;
 pub mod hardfork;
 pub mod spec;
-pub use spec::TempoChainSpec;
+pub use spec::{TempoChainSpec, TempoGenesisInfo};

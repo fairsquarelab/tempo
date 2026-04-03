@@ -14,7 +14,7 @@ use commonware_runtime::{
 };
 use rand_08::{CryptoRng, Rng};
 
-use crate::{epoch::scheme_provider::SchemeProvider, feed, subblocks};
+use crate::{epoch::scheme_provider::SchemeProvider, feed, oracle_price_feed, subblocks};
 
 pub(crate) struct Config<TBlocker> {
     pub(crate) application: crate::consensus::application::Mailbox,
@@ -25,6 +25,7 @@ pub(crate) struct Config<TBlocker> {
     pub(crate) time_to_propose: Duration,
     pub(crate) mailbox_size: usize,
     pub(crate) subblocks: Option<subblocks::Mailbox>,
+    pub(crate) oracle_price_feed: oracle_price_feed::Mailbox,
     pub(crate) marshal: crate::alias::marshal::Mailbox,
     pub(crate) feed: feed::Mailbox,
     pub(crate) scheme_provider: SchemeProvider,

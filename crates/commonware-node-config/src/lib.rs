@@ -137,3 +137,49 @@ enum SigningShareErrorKind {
     #[error("failed writing to file")]
     Write(#[source] std::io::Error),
 }
+
+/// A SECP256K1 private key for signing EVM transactions (oracle price feeds, etc.).
+#[derive(Clone)]
+pub struct EvmSigningKey {
+    inner: alloy_signer_local::PrivateKeySigner,
+}
+
+impl EvmSigningKey {
+    pub fn into_inner(self) -> alloy_signer_local::PrivateKeySigner {
+        self.inner
+    }
+
+    pub fn read_from_file<P: AsRef<Path>>(path: P) -> Result<Self, EvmSigningKeyError> {
+        let hex = std::fs::read_to_string(path).map_err(EvmSigningKeyErrorKind::Read)?;
+        Self::try_from_hex(hex.trim())
+    }
+
+    pub fn try_from_hex(hex: &str) -> Result<Self, EvmSigningKeyError> {
+        let inner: alloy_signer_local::PrivateKeySigner =
+            hex.parse().map_err(EvmSigningKeyErrorKind::Parse)?;
+        Ok(Self { inner })
+    }
+}
+
+impl std::fmt::Debug for EvmSigningKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EvmSigningKey")
+            .field("address", &self.inner.address())
+            .finish()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error(transparent)]
+pub struct EvmSigningKeyError {
+    #[from]
+    inner: EvmSigningKeyErrorKind,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum EvmSigningKeyErrorKind {
+    #[error("failed parsing hex as SECP256K1 private key")]
+    Parse(#[source] alloy_signer_local::LocalSignerError),
+    #[error("failed reading file")]
+    Read(#[source] std::io::Error),
+}

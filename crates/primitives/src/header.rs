@@ -4,8 +4,8 @@ use alloy_rlp::{RlpDecodable, RlpEncodable};
 
 /// Tempo block header.
 ///
-/// Encoded as `rlp([general_gas_limit, shared_gas_limit, timestamp_millis_part, inner])` meaning that any new
-/// fields added to the inner header will only affect the first list element.
+/// Encoded as `rlp([general_gas_limit, shared_gas_limit, timestamp_millis_part, inner])`.
+/// Tempo-specific fields are encoded before the inner Ethereum header.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, RlpEncodable, RlpDecodable)]
 #[cfg_attr(feature = "reth-codec", derive(reth_codecs::Compact))]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -200,5 +200,24 @@ impl reth_db_api::table::Decompress for TempoHeader {
     fn decompress(value: &[u8]) -> Result<Self, reth_db_api::DatabaseError> {
         let (obj, _) = reth_codecs::Compact::from_compact(value, value.len());
         Ok(obj)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloy_rlp::{Decodable, Encodable};
+
+    #[test]
+    fn tempo_header_rlp_roundtrip() {
+        let mut header = TempoHeader::default();
+        header.timestamp_millis_part = 0x7e;
+
+        let mut buf = Vec::new();
+        header.encode(&mut buf);
+        let decoded = TempoHeader::decode(&mut buf.as_slice()).expect("decode");
+
+        assert_eq!(decoded.timestamp_millis_part, header.timestamp_millis_part);
+        assert_eq!(decoded, header);
     }
 }

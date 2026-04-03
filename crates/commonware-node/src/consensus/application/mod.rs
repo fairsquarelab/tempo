@@ -18,7 +18,7 @@ mod ingress;
 pub(super) use actor::Actor;
 pub(crate) use ingress::Mailbox;
 
-use crate::{epoch::SchemeProvider, subblocks};
+use crate::{epoch::SchemeProvider, oracle_price_feed, subblocks};
 
 pub(super) async fn init<TContext>(
     config: Config<TContext>,
@@ -66,4 +66,7 @@ pub(super) struct Config<TContext> {
 
     /// The scheme provider to use for the application.
     pub(crate) scheme_provider: SchemeProvider,
+
+    /// Oracle price feed actor (P2P + top-of-block staging for the payload builder).
+    pub(super) oracle_price_feed: oracle_price_feed::Mailbox,
 }

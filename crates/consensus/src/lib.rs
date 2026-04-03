@@ -144,6 +144,12 @@ impl Consensus<Block> for TempoConsensus {
     ) -> Result<(), ConsensusError> {
         let transactions = &block.body().transactions;
 
+        // Stateful oracle checks (parent-state `ceil(active×num/den)` vs `updatePriceFeed` count,
+        // bundle shape, `setPriceFeed` signer == beneficiary, leader-signed `updatePriceFeed` when
+        // `active_indices` is non-empty) run in `tempo-evm` at execution start — see
+        // `validate_top_of_block_oracle_bundle` in `apply_pre_execution_changes` when
+        // `TempoBlockExecutionCtx::transactions` is set. This trait stays stateless per Reth.
+
         if let Some(tx) = transactions.iter().find(|&tx| {
             tx.is_system_tx() && !tx.is_valid_system_tx(self.inner.chain_spec().chain().id())
         }) {

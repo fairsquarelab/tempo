@@ -16,20 +16,23 @@ pub(crate) mod peer_manager;
 pub(crate) mod utils;
 pub(crate) mod validators;
 
+pub mod oracle_price_feed;
 pub(crate) mod subblocks;
 
+use alloy_primitives::Address;
 use commonware_cryptography::ed25519::{PrivateKey, PublicKey};
 use commonware_p2p::authenticated::lookup;
 use commonware_runtime::Metrics as _;
 use eyre::{OptionExt, WrapErr as _, eyre};
 use tempo_commonware_node_config::SigningShare;
 use tempo_node::TempoFullNode;
+use tracing::{info, warn};
 
 pub use crate::config::{
     BROADCASTER_CHANNEL_IDENT, BROADCASTER_LIMIT, CERTIFICATES_CHANNEL_IDENT, CERTIFICATES_LIMIT,
     DKG_CHANNEL_IDENT, DKG_LIMIT, MARSHAL_CHANNEL_IDENT, MARSHAL_LIMIT, NAMESPACE,
-    RESOLVER_CHANNEL_IDENT, RESOLVER_LIMIT, SUBBLOCKS_CHANNEL_IDENT, SUBBLOCKS_LIMIT,
-    VOTES_CHANNEL_IDENT, VOTES_LIMIT,
+    ORACLE_PRICE_FEED_CHANNEL_IDENT, ORACLE_PRICE_FEED_LIMIT, RESOLVER_CHANNEL_IDENT,
+    RESOLVER_LIMIT, SUBBLOCKS_CHANNEL_IDENT, SUBBLOCKS_LIMIT, VOTES_CHANNEL_IDENT, VOTES_LIMIT,
 };
 
 pub use args::{Args, PositiveDuration};
@@ -84,10 +87,59 @@ pub async fn run_consensus_stack(
     // sure that we don't ban peers that activate subblocks and send messages
     // through this subchannel.
     let subblocks = network.register(SUBBLOCKS_CHANNEL_IDENT, SUBBLOCKS_LIMIT, message_backlog);
+    let oracle_price_feed = network.register(
+        ORACLE_PRICE_FEED_CHANNEL_IDENT,
+        ORACLE_PRICE_FEED_LIMIT,
+        message_backlog,
+    );
 
-    let fee_recipient = config
+    let mut fee_recipient = config
         .fee_recipient
         .ok_or_eyre("required option `consensus.fee-recipient` not set")?;
+
+    let evm_signer = config.evm_signing_key()?.map(|key| key.into_inner());
+
+    // `setPriceFeed` must be signed by the block beneficiary (`fee_recipient`); the oracle actor
+    // always signs with `evm_signer`. Any mismatch (e.g. `--node-args` overriding fee-recipient after
+    // tempo.nu) breaks payload validation — force alignment whenever oracle HTTP config is enabled.
+    if config.oracle_config.is_some() {
+        let Some(ref signer) = evm_signer else {
+            eyre::bail!(
+                "`consensus.oracle-config` requires `consensus.evm-signing-key` (setPriceFeed must match block beneficiary)"
+            );
+        };
+        let aligned = signer.address();
+        if fee_recipient != aligned {
+            if fee_recipient != Address::ZERO {
+                warn!(
+                    configured = %fee_recipient,
+                    aligned = %aligned,
+                    "consensus.fee-recipient does not match EVM oracle signer; overriding to signer address"
+                );
+            } else {
+                info!(
+                    %aligned,
+                    "consensus.fee-recipient was zero; using EVM oracle signer address for block beneficiary"
+                );
+            }
+            fee_recipient = aligned;
+        }
+    } else if fee_recipient == Address::ZERO {
+        if let Some(ref signer) = evm_signer {
+            fee_recipient = signer.address();
+            info!(
+                %fee_recipient,
+                "consensus.fee-recipient was zero; using EVM oracle signer address for block beneficiary"
+            );
+        }
+    }
+
+    let oracle_config = config
+        .oracle_config
+        .as_deref()
+        .map(crate::oracle_price_feed::config::OracleConfig::load)
+        .transpose()
+        .wrap_err("failed to load oracle config")?;
 
     let consensus_engine = crate::consensus::engine::Builder {
         fee_recipient,
@@ -116,6 +168,8 @@ pub async fn run_consensus_stack(
         subblock_broadcast_interval: config.subblock_broadcast_interval.into_duration(),
         fcu_heartbeat_interval: config.fcu_heartbeat_interval.into_duration(),
         with_subblocks: config.enable_subblocks,
+        evm_signer,
+        oracle_config,
 
         feed_state,
     }
@@ -133,6 +187,7 @@ pub async fn run_consensus_stack(
             marshal,
             dkg,
             subblocks,
+            oracle_price_feed,
         ),
     );
 

@@ -51,7 +51,7 @@ use reth_rpc_builder::RpcModuleSelection;
 use secp256k1::SecretKey;
 use std::net::TcpListener;
 use tempfile::TempDir;
-use tempo_chainspec::TempoChainSpec;
+use tempo_chainspec::{TempoChainSpec, TempoGenesisInfo};
 use tempo_commonware_node::feed::FeedStateHandle;
 use tempo_dkg_onchain_artifacts::OnchainDkgOutcome;
 use tempo_node::{
@@ -61,8 +61,9 @@ use tempo_node::{
     rpc::consensus::{TempoConsensusApiServer, TempoConsensusRpc},
 };
 use tempo_precompiles::{
-    VALIDATOR_CONFIG_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
+    TEMPO_ORACLE_ADDRESS, VALIDATOR_CONFIG_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
     storage::StorageCtx,
+    tempo_oracle::TempoOracle,
     validator_config::{IValidatorConfig, ValidatorConfig},
     validator_config_v2::{
         IValidatorConfigV2, VALIDATOR_NS_ADD, VALIDATOR_NS_ROTATE, ValidatorConfigV2,
@@ -75,6 +76,10 @@ use crate::{ConsensusNodeConfig, TestingNode};
 const ADMIN_INDEX: u32 = 0;
 const VALIDATOR_START_INDEX: u32 = 1;
 
+/// Mnemonic indices for oracle `updatePriceFeed` / `setPriceFeed` signers (`test ... junk`).
+/// Kept above normal validator/admin indices so they do not collide with `validator(i)` keys.
+pub const ORACLE_EVM_MNEMONIC_BASE: u32 = 40;
+
 /// Same mnemonic as used in the imported test-genesis and in the `tempo-node` integration tests.
 pub const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
 
@@ -84,6 +89,8 @@ pub struct Builder {
     initial_dkg_outcome: Option<OnchainDkgOutcome>,
     t2_time: Option<u64>,
     validators: Option<ordered::Map<PublicKey, ConsensusNodeConfig>>,
+    oracle_currencies: Vec<u32>,
+    oracle_registry_admin: Option<Address>,
 }
 
 impl Builder {
@@ -93,6 +100,8 @@ impl Builder {
             initial_dkg_outcome: None,
             t2_time: None,
             validators: None,
+            oracle_currencies: Vec::new(),
+            oracle_registry_admin: None,
         }
     }
 
@@ -124,12 +133,21 @@ impl Builder {
         }
     }
 
+    /// Register oracle currencies at genesis (`TempoOracle::registerCurrency` during genesis EVM setup).
+    pub fn with_oracle_currencies(mut self, currencies: Vec<u32>, registry_admin: Address) -> Self {
+        self.oracle_currencies = currencies;
+        self.oracle_registry_admin = Some(registry_admin);
+        self
+    }
+
     pub fn launch(self) -> eyre::Result<ExecutionRuntime> {
         let Self {
             epoch_length,
             initial_dkg_outcome,
             t2_time,
             validators,
+            oracle_currencies,
+            oracle_registry_admin,
         } = self;
 
         let epoch_length = epoch_length.ok_or_eyre("must specify epoch length")?;
@@ -159,16 +177,61 @@ impl Builder {
             .insert_value("t2Time".to_string(), t2_time)
             .unwrap();
 
+        if !oracle_currencies.is_empty() {
+            genesis
+                .config
+                .extra_fields
+                .insert_value("oracleCurrencies".to_string(), oracle_currencies.clone())
+                .unwrap();
+            let admin = oracle_registry_admin.ok_or_eyre(
+                "oracle_registry_admin is required when oracle_currencies is non-empty",
+            )?;
+            genesis
+                .config
+                .extra_fields
+                .insert_value("oracleRegistryAdmin".to_string(), format!("{admin:#x}"))
+                .unwrap();
+        }
+
+        let evm_signer_funding: Vec<Address> = validators
+            .iter_pairs()
+            .map(|(_, cfg)| cfg.evm_signing_key.address())
+            .collect();
+
+        let tempo_genesis = TempoGenesisInfo::from_genesis(&genesis);
+
         genesis.extra_data = initial_dkg_outcome.encode().to_vec().into();
 
         // Just remove whatever is already written into chainspec.
         genesis.alloc.remove(&VALIDATOR_CONFIG_ADDRESS);
         genesis.alloc.remove(&VALIDATOR_CONFIG_V2_ADDRESS);
+        // Re-seed TempoOracle from `TempoGenesisInfo` (avoid stale storage vs slot layout).
+        genesis.alloc.remove(&TEMPO_ORACLE_ADDRESS);
 
         let mut evm = setup_tempo_evm(genesis.config.chain_id);
         {
             let cx = evm.ctx_mut();
             StorageCtx::enter_evm(&mut cx.journaled_state, &cx.block, &cx.cfg, &cx.tx, || {
+                let mut oracle = TempoOracle::new();
+                oracle
+                    .initialize_with_oracle_params(
+                        tempo_genesis.oracle_max_deviation_bps(),
+                        tempo_genesis.oracle_feed_threshold_num(),
+                        tempo_genesis.oracle_feed_threshold_den(),
+                    )
+                    .wrap_err("failed to initialize TempoOracle")
+                    .unwrap();
+                if let Some(registry_admin) = tempo_genesis.oracle_registry_admin() {
+                    for &currency_id in tempo_genesis.oracle_currencies() {
+                        oracle
+                            .register_currency(registry_admin, currency_id)
+                            .wrap_err_with(|| {
+                                format!("failed to register oracle currency {currency_id}")
+                            })
+                            .unwrap();
+                    }
+                }
+
                 // TODO(janis): figure out the owner of the test-genesis.json
                 let mut validator_config = ValidatorConfig::new();
                 validator_config
@@ -192,6 +255,7 @@ impl Builder {
                         fee_recipient,
                         private_key,
                         share: Some(_),
+                        ..
                     } = validator
                     {
                         validator_config
@@ -217,6 +281,7 @@ impl Builder {
                                         ingress: ingress.to_string(),
                                         egress: egress.ip().to_string(),
                                         feeRecipient: fee_recipient,
+                                        oracleFeedSigner: Address::ZERO,
                                         signature: sign_add_validator_args(
                                             genesis.config.chain_id,
                                             &private_key,
@@ -254,11 +319,28 @@ impl Builder {
                 *address,
                 GenesisAccount {
                     nonce: Some(account.info.nonce),
+                    balance: account.info.balance,
                     code: account.info.code.as_ref().map(|c| c.original_bytes()),
                     storage,
                     ..Default::default()
                 },
             );
+        }
+
+        // Native balance for oracle EVM signers (updatePriceFeed / setPriceFeed gas).
+        let fund_wei = U256::from(10u128.pow(21));
+        for addr in evm_signer_funding {
+            if let Some(acc) = genesis.alloc.get_mut(&addr) {
+                acc.balance = acc.balance.saturating_add(fund_wei);
+            } else {
+                genesis.alloc.insert(
+                    addr,
+                    GenesisAccount {
+                        balance: fund_wei,
+                        ..Default::default()
+                    },
+                );
+            }
         }
 
         Ok(ExecutionRuntime::with_chain_spec(
@@ -472,6 +554,7 @@ impl ExecutionRuntime {
                                     ingress.to_string(),
                                     egress.to_string(),
                                     fee_recipient,
+                                    Address::ZERO,
                                     sign_add_validator_args(
                                         EthChainSpec::chain(&chain_spec).id(),
                                         &private_key,
@@ -1435,6 +1518,7 @@ fn sign_add_validator_args(
     hasher.update([egress.to_string().len() as u8]);
     hasher.update(egress.to_string().as_bytes());
     hasher.update(fee_recipient.as_slice());
+    hasher.update(Address::ZERO.as_slice());
     let msg = hasher.finalize();
     key.sign(VALIDATOR_NS_ADD, msg.as_slice())
 }

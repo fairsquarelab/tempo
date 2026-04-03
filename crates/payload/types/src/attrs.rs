@@ -3,12 +3,13 @@ use alloy_rpc_types_engine::PayloadId;
 use alloy_rpc_types_eth::Withdrawals;
 use reth_ethereum_engine_primitives::{EthPayloadAttributes, EthPayloadBuilderAttributes};
 use reth_node_api::{PayloadAttributes, PayloadBuilderAttributes};
+use reth_primitives_traits::Recovered;
 use serde::{Deserialize, Serialize};
 use std::{
     convert::Infallible,
     sync::{Arc, atomic, atomic::Ordering},
 };
-use tempo_primitives::RecoveredSubBlock;
+use tempo_primitives::{RecoveredSubBlock, TempoTxEnvelope};
 
 /// A handle for a payload interrupt flag.
 ///
@@ -33,6 +34,11 @@ impl InterruptHandle {
 /// The `TempoPayloadBuilderAttributes` has an additional feature of interrupting payload.
 ///
 /// It also carries DKG data to be included in the block's extra_data field.
+///
+/// **Oracle (T2+)**: [`Self::oracle_txs`] is invoked once per payload build after
+/// `apply_pre_execution_changes` and **before** pool transactions. The node should return
+/// recovered txs in protocol order: non-leader `updatePriceFeed`s, the leader `updatePriceFeed`,
+/// then `setPriceFeed` (see protocol spec). Timeouts and collection belong inside the closure.
 #[derive(derive_more::Debug, Clone)]
 pub struct TempoPayloadBuilderAttributes {
     inner: EthPayloadBuilderAttributes,
@@ -45,6 +51,9 @@ pub struct TempoPayloadBuilderAttributes {
     extra_data: Bytes,
     #[debug(skip)]
     subblocks: Arc<dyn Fn() -> Vec<RecoveredSubBlock> + Send + Sync + 'static>,
+    /// Recovered txs for the top-of-block TempoOracle bundle (empty when not building oracle).
+    #[debug(skip)]
+    oracle_txs: Arc<dyn Fn() -> Vec<Recovered<TempoTxEnvelope>> + Send + Sync + 'static>,
 }
 
 impl TempoPayloadBuilderAttributes {
@@ -56,6 +65,7 @@ impl TempoPayloadBuilderAttributes {
         timestamp_millis: u64,
         extra_data: Bytes,
         subblocks: impl Fn() -> Vec<RecoveredSubBlock> + Send + Sync + 'static,
+        oracle_txs: impl Fn() -> Vec<Recovered<TempoTxEnvelope>> + Send + Sync + 'static,
     ) -> Self {
         let (seconds, millis) = (timestamp_millis / 1000, timestamp_millis % 1000);
         Self {
@@ -72,7 +82,13 @@ impl TempoPayloadBuilderAttributes {
             timestamp_millis_part: millis,
             extra_data,
             subblocks: Arc::new(subblocks),
+            oracle_txs: Arc::new(oracle_txs),
         }
+    }
+
+    /// Invokes the oracle bundle supplier (see struct docs).
+    pub fn oracle_txs(&self) -> Vec<Recovered<TempoTxEnvelope>> {
+        (self.oracle_txs)()
     }
 
     /// Returns the extra data to be included in the block header.
@@ -121,6 +137,7 @@ impl From<EthPayloadBuilderAttributes> for TempoPayloadBuilderAttributes {
             timestamp_millis_part: 0,
             extra_data: Bytes::default(),
             subblocks: Arc::new(Vec::new),
+            oracle_txs: Arc::new(Vec::new),
         }
     }
 }
@@ -147,6 +164,7 @@ impl PayloadBuilderAttributes for TempoPayloadBuilderAttributes {
             timestamp_millis_part,
             extra_data: Bytes::default(),
             subblocks: Arc::new(Vec::new),
+            oracle_txs: Arc::new(Vec::new),
         })
     }
 
@@ -220,6 +238,10 @@ mod tests {
             self,
             f: impl Fn() -> Vec<RecoveredSubBlock> + Send + Sync + 'static,
         ) -> Self;
+        fn with_oracle_txs(
+            self,
+            f: impl Fn() -> Vec<Recovered<TempoTxEnvelope>> + Send + Sync + 'static,
+        ) -> Self;
     }
 
     impl TestExt for TempoPayloadBuilderAttributes {
@@ -230,6 +252,7 @@ mod tests {
                 Address::random(),
                 1000,
                 Bytes::default(),
+                Vec::new,
                 Vec::new,
             )
         }
@@ -247,6 +270,35 @@ mod tests {
             self.subblocks = Arc::new(f);
             self
         }
+
+        fn with_oracle_txs(
+            mut self,
+            f: impl Fn() -> Vec<Recovered<TempoTxEnvelope>> + Send + Sync + 'static,
+        ) -> Self {
+            self.oracle_txs = Arc::new(f);
+            self
+        }
+    }
+
+    #[test]
+    fn oracle_txs_default_empty() {
+        let attrs = TempoPayloadBuilderAttributes::random();
+        assert!(attrs.oracle_txs().is_empty());
+    }
+
+    #[test]
+    fn oracle_txs_callback_runs() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        let attrs = TempoPayloadBuilderAttributes::random().with_oracle_txs(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+            Vec::new()
+        });
+        attrs.oracle_txs();
+        attrs.oracle_txs();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]
@@ -292,6 +344,7 @@ mod tests {
             timestamp_millis,
             extra_data.clone(),
             Vec::new,
+            Vec::new,
         );
         assert_eq!(attrs.extra_data(), &extra_data);
         assert_eq!(attrs.parent(), parent);
@@ -312,6 +365,7 @@ mod tests {
             recipient,
             timestamp_millis + 500, // 1.5 seconds + 500ms
             Bytes::default(),
+            Vec::new,
             Vec::new,
         );
         assert_eq!(attrs2.extra_data(), &Bytes::default());

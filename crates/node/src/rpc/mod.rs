@@ -117,15 +117,10 @@ impl<N: FullNodeTypes<Types = TempoNode>> TempoEthApi<N> {
     pub fn subblock_transactions_rx(&self) -> broadcast::Receiver<Recovered<TempoTxEnvelope>> {
         self.subblock_transactions_tx.subscribe()
     }
+}
 
-    /// Returns `true` if the given partial validator key matches this node's validator key.
-    ///
-    /// Returns `false` if no validator key is configured (non-validator nodes reject
-    /// all subblock transactions).
-    fn matches_validator_key(&self, partial_key: &PartialValidatorKey) -> bool {
-        self.validator_key
-            .is_some_and(|key| partial_key.matches(key.as_slice()))
-    }
+fn matches_validator_key(validator_key: Option<B256>, partial_key: &PartialValidatorKey) -> bool {
+    validator_key.is_some_and(|key| partial_key.matches(key.as_slice()))
 }
 
 impl<N: FullNodeTypes<Types = TempoNode>> EthApiTypes for TempoEthApi<N> {
@@ -347,8 +342,9 @@ impl<N: FullNodeTypes<Types = TempoNode>> EthTransactions for TempoEthApi<N> {
         origin: TransactionOrigin,
         tx: WithEncoded<Recovered<PoolPooledTx<Self::Pool>>>,
     ) -> impl Future<Output = Result<B256, Self::Error>> + Send {
-        match tx.value().inner().subblock_proposer() {
-            Some(proposer) if self.matches_validator_key(&proposer) => {
+        let subblock_proposer = tx.value().inner().subblock_proposer();
+        match subblock_proposer {
+            Some(ref proposer) if matches_validator_key(self.validator_key, proposer) => {
                 let subblock_tx = self.subblock_transactions_tx.clone();
                 Either::Left(Either::Left(async move {
                     let tx_hash = *tx.value().tx_hash();
@@ -489,7 +485,7 @@ impl ReceiptConverter<TempoPrimitives> for TempoReceiptConverter {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct TempoEthApiBuilder {
     /// Validator public key used to filter subblock transactions.
     pub validator_key: Option<B256>,

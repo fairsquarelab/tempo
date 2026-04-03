@@ -12,6 +12,7 @@ pub(crate) mod ip_validation;
 pub mod account_keychain;
 pub mod nonce;
 pub mod stablecoin_dex;
+pub mod tempo_oracle;
 pub mod tip20;
 pub mod tip20_factory;
 pub mod tip403_registry;
@@ -27,6 +28,7 @@ use crate::{
     nonce::NonceManager,
     stablecoin_dex::StablecoinDEX,
     storage::StorageCtx,
+    tempo_oracle::TempoOracle,
     tip_fee_manager::TipFeeManager,
     tip20::{TIP20Token, is_tip20_prefix},
     tip20_factory::TIP20Factory,
@@ -53,7 +55,7 @@ use revm::{
 
 pub use tempo_contracts::precompiles::{
     ACCOUNT_KEYCHAIN_ADDRESS, DEFAULT_FEE_TOKEN, NONCE_PRECOMPILE_ADDRESS, PATH_USD_ADDRESS,
-    STABLECOIN_DEX_ADDRESS, TIP_FEE_MANAGER_ADDRESS, TIP20_FACTORY_ADDRESS,
+    STABLECOIN_DEX_ADDRESS, TEMPO_ORACLE_ADDRESS, TIP_FEE_MANAGER_ADDRESS, TIP20_FACTORY_ADDRESS,
     TIP403_REGISTRY_ADDRESS, VALIDATOR_CONFIG_ADDRESS, VALIDATOR_CONFIG_V2_ADDRESS,
 };
 
@@ -110,7 +112,7 @@ pub fn tempo_precompiles(cfg: &CfgEnv<TempoHardfork>) -> PrecompilesMap {
 /// Registers Tempo-specific precompiles into an existing [`PrecompilesMap`] by installing a
 /// lookup function that matches addresses to their precompile: TIP-20 tokens (by prefix),
 /// TIP20Factory, TIP403Registry, TipFeeManager, StablecoinDEX, NonceManager, ValidatorConfig,
-/// AccountKeychain, and ValidatorConfigV2. Each precompile is wrapped via the `tempo_precompile!`
+/// AccountKeychain, ValidatorConfigV2, and TempoOracle. Each precompile is wrapped via the `tempo_precompile!`
 /// macro which enforces direct-call-only (no delegatecall) and sets up the storage context.
 pub fn extend_tempo_precompiles(precompiles: &mut PrecompilesMap, cfg: &CfgEnv<TempoHardfork>) {
     let cfg = cfg.clone();
@@ -134,6 +136,8 @@ pub fn extend_tempo_precompiles(precompiles: &mut PrecompilesMap, cfg: &CfgEnv<T
             Some(AccountKeychain::create_precompile(&cfg))
         } else if *address == VALIDATOR_CONFIG_V2_ADDRESS {
             Some(ValidatorConfigV2::create_precompile(&cfg))
+        } else if *address == TEMPO_ORACLE_ADDRESS {
+            Some(TempoOracle::create_precompile(&cfg))
         } else {
             None
         }
@@ -232,6 +236,13 @@ impl ValidatorConfigV2 {
     /// Creates the EVM precompile for this type.
     pub fn create_precompile(cfg: &CfgEnv<TempoHardfork>) -> DynPrecompile {
         tempo_precompile!("ValidatorConfigV2", cfg, |input| { Self::new() })
+    }
+}
+
+impl TempoOracle {
+    /// Creates the EVM precompile for this type.
+    pub fn create_precompile(cfg: &CfgEnv<TempoHardfork>) -> DynPrecompile {
+        tempo_precompile!("TempoOracle", cfg, |input| { Self::new() })
     }
 }
 
@@ -633,6 +644,13 @@ mod tests {
         assert!(
             keychain_precompile.is_some(),
             "AccountKeychain should be registered"
+        );
+
+        // TempoOracle should be registered
+        let oracle_precompile = precompiles.get(&TEMPO_ORACLE_ADDRESS);
+        assert!(
+            oracle_precompile.is_some(),
+            "TempoOracle should be registered"
         );
 
         // TIP20 tokens with prefix should be registered

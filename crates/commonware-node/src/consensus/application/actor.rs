@@ -52,7 +52,7 @@ use super::{
 use crate::{
     consensus::{Digest, block::Block},
     epoch::SchemeProvider,
-    subblocks,
+    oracle_price_feed, subblocks,
 };
 
 pub(in crate::consensus) struct Actor<TContext, TState = Uninit> {
@@ -96,6 +96,8 @@ where
                 subblocks: config.subblocks,
 
                 scheme_provider: config.scheme_provider,
+
+                oracle_price_feed: config.oracle_price_feed,
 
                 state: Uninit(()),
             },
@@ -197,6 +199,8 @@ struct Inner<TState> {
     executor: crate::executor::Mailbox,
     subblocks: Option<subblocks::Mailbox>,
     scheme_provider: SchemeProvider,
+
+    oracle_price_feed: oracle_price_feed::Mailbox,
 
     state: TState,
 }
@@ -525,6 +529,7 @@ impl Inner<Init> {
             }
         };
 
+        let oracle_price_feed = self.oracle_price_feed.clone();
         let attrs = TempoPayloadBuilderAttributes::new(
             // XXX: derives the payload ID from the parent so that
             // overlong payload builds will eventually succeed on the
@@ -542,6 +547,11 @@ impl Inner<Init> {
                 self.subblocks
                     .as_ref()
                     .and_then(|s| s.get_subblocks(parent.block_hash()).ok())
+                    .unwrap_or_default()
+            },
+            move || {
+                oracle_price_feed
+                    .get_oracle_price_feeds()
                     .unwrap_or_default()
             },
         );
@@ -720,6 +730,8 @@ impl Inner<Uninit> {
             },
             subblocks: self.subblocks,
             scheme_provider: self.scheme_provider,
+
+            oracle_price_feed: self.oracle_price_feed,
         };
 
         Ok(initialized)

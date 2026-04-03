@@ -5,7 +5,7 @@ use std::{
 
 use commonware_cryptography::ed25519::PublicKey;
 use eyre::Context;
-use tempo_commonware_node_config::SigningKey;
+use tempo_commonware_node_config::{EvmSigningKey, SigningKey};
 
 const DEFAULT_MAX_MESSAGE_SIZE_BYTES: u32 =
     reth_consensus_common::validation::MAX_RLP_BLOCK_SIZE as u32;
@@ -119,6 +119,14 @@ pub struct Args {
         default_value = "450ms"
     )]
     pub minimum_time_before_propose: PositiveDuration,
+
+    /// The file containing the SECP256K1 private key for signing EVM oracle transactions.
+    #[arg(long = "consensus.evm-signing-key")]
+    evm_signing_key: Option<PathBuf>,
+
+    /// Path to a TOML file configuring oracle price feed sources and pairs.
+    #[arg(long = "consensus.oracle-config")]
+    pub oracle_config: Option<PathBuf>,
 
     /// Whether to enable subblock processing.
     ///
@@ -319,5 +327,20 @@ impl Args {
         Ok(self
             .signing_key()?
             .map(|signing_key| signing_key.public_key()))
+    }
+
+    /// Returns the EVM signing key loaded from specified file.
+    pub(crate) fn evm_signing_key(&self) -> eyre::Result<Option<EvmSigningKey>> {
+        self.evm_signing_key
+            .as_ref()
+            .map(|path| {
+                EvmSigningKey::read_from_file(path).wrap_err_with(|| {
+                    format!(
+                        "failed reading SECP256K1 EVM signing key from file `{}`",
+                        path.display()
+                    )
+                })
+            })
+            .transpose()
     }
 }

@@ -4,7 +4,8 @@ use std::net::SocketAddr;
 use crate::{
     generate_devnet::GenerateDevnet, generate_genesis::GenerateGenesis,
     generate_localnet::GenerateLocalnet, generate_state_bloat::GenerateStateBloat,
-    get_dkg_outcome::GetDkgOutcome,
+    get_dkg_outcome::GetDkgOutcome, prepare_oracle_localnet::PrepareOracleLocalnet,
+    verify_oracle_blocks::VerifyOracleBlocks,
 };
 
 use alloy::signers::{local::MnemonicBuilder, utils::secret_key_to_address};
@@ -18,6 +19,8 @@ mod generate_localnet;
 mod generate_state_bloat;
 mod genesis_args;
 mod get_dkg_outcome;
+mod prepare_oracle_localnet;
+mod verify_oracle_blocks;
 
 #[tokio::main]
 async fn main() -> eyre::Result<()> {
@@ -38,6 +41,8 @@ async fn main() -> eyre::Result<()> {
             .run()
             .await
             .wrap_err("failed to generate state bloat file"),
+        Action::PrepareOracleLocalnet(args) => args.run().wrap_err("prepare oracle localnet"),
+        Action::VerifyOracleBlocks(args) => args.run().await.wrap_err("verify oracle blocks"),
     }
 }
 
@@ -59,6 +64,8 @@ enum Action {
     GenerateLocalnet(GenerateLocalnet),
     GenerateAddPeer(GenerateAddPeer),
     GenerateStateBloat(GenerateStateBloat),
+    PrepareOracleLocalnet(PrepareOracleLocalnet),
+    VerifyOracleBlocks(VerifyOracleBlocks),
 }
 
 #[derive(Debug, clap::Args)]

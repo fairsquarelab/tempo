@@ -203,6 +203,7 @@ mod tests {
             msg_data.push(u8::try_from("192.168.1.1".len()).unwrap());
             msg_data.extend_from_slice(b"192.168.1.1");
             msg_data.extend_from_slice(validator_addr.as_slice());
+            msg_data.extend_from_slice(Address::ZERO.as_slice());
             let message = alloy::primitives::keccak256(&msg_data);
 
             // Sign with namespace
@@ -220,6 +221,7 @@ mod tests {
                 ingress: "192.168.1.1:8000".to_string(),
                 egress: "192.168.1.1".to_string(),
                 feeRecipient: validator_addr,
+                oracleFeedSigner: Address::ZERO,
                 signature: signature.encode().to_vec().into(),
             };
             let calldata = add_call.abi_encode();
@@ -252,6 +254,7 @@ mod tests {
                 ingress: "192.168.1.1:8000".to_string(),
                 egress: "192.168.1.1".to_string(),
                 feeRecipient: validator_addr,
+                oracleFeedSigner: Address::ZERO,
                 signature: vec![0u8; 64].into(),
             };
             let calldata = add_call.abi_encode();

@@ -20,8 +20,8 @@ use revm::{
 };
 use tempo_contracts::precompiles::{
     AccountKeychainError, FeeManagerError, NonceError, RolesAuthError, StablecoinDEXError,
-    TIP20FactoryError, TIP403RegistryError, TIPFeeAMMError, UnknownFunctionSelector,
-    ValidatorConfigError, ValidatorConfigV2Error,
+    TIP20FactoryError, TIP403RegistryError, TIPFeeAMMError, TempoOracleError,
+    UnknownFunctionSelector, ValidatorConfigError, ValidatorConfigV2Error,
 };
 
 /// Top-level error type for all Tempo precompile operations
@@ -77,6 +77,10 @@ pub enum TempoPrecompileError {
     #[error("Account keychain error: {0:?}")]
     AccountKeychainError(AccountKeychainError),
 
+    /// Error from TempoOracle precompile
+    #[error("TempoOracle error: {0:?}")]
+    TempoOracleError(TempoOracleError),
+
     /// Gas limit exceeded during precompile execution.
     #[error("Gas limit exceeded")]
     OutOfGas,
@@ -120,6 +124,7 @@ impl TempoPrecompileError {
             | Self::ValidatorConfigError(_)
             | Self::ValidatorConfigV2Error(_)
             | Self::AccountKeychainError(_)
+            | Self::TempoOracleError(_)
             | Self::UnknownFunctionSelector(_) => false,
         }
     }
@@ -159,6 +164,7 @@ impl TempoPrecompileError {
             Self::ValidatorConfigError(e) => e.abi_encode().into(),
             Self::ValidatorConfigV2Error(e) => e.abi_encode().into(),
             Self::AccountKeychainError(e) => e.abi_encode().into(),
+            Self::TempoOracleError(e) => e.abi_encode().into(),
             Self::OutOfGas => {
                 return Err(PrecompileError::OutOfGas);
             }
@@ -224,6 +230,7 @@ pub fn error_decoder_registry() -> TempoPrecompileErrorRegistry {
     add_errors_to_registry(&mut registry, TempoPrecompileError::ValidatorConfigError);
     add_errors_to_registry(&mut registry, TempoPrecompileError::ValidatorConfigV2Error);
     add_errors_to_registry(&mut registry, TempoPrecompileError::AccountKeychainError);
+    add_errors_to_registry(&mut registry, TempoPrecompileError::TempoOracleError);
 
     registry
 }
